@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "station-persist"
+version = "0.1.0"
+description = "Safe Redis telemetry inspection and consumer infrastructure"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["asyncpg>=0.30,<1", "redis[hiredis]>=5.2,<7", "pydantic-settings>=2.7,<3"]
+
+[project.optional-dependencies]
+test = ["pytest>=8.3,<9", "pytest-asyncio>=0.25,<2", "pytest-cov>=6,<8"]
+lint = ["ruff>=0.11,<1"]
+
+[project.scripts]
+station-persist = "station_persist.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/station_persist"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = ["integration: requires disposable Redis and PostgreSQL"]
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B", "UP"]
+
+[tool.coverage.run]
+source = ["station_persist"]
+
+[tool.coverage.report]
+fail_under = 80
