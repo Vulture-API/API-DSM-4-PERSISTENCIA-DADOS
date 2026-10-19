@@ -10,6 +10,8 @@ from redis.asyncio import Redis
 from station_persist.config import Settings
 from station_persist.inspection import inspect_stream
 from station_persist.logging_config import log_event
+from station_persist.relationships import resolve_entries
+from station_persist.stream import StreamEntry
 
 
 def install_signal_handlers(stop: asyncio.Event) -> list[signal.Signals]:
@@ -24,7 +26,10 @@ def install_signal_handlers(stop: asyncio.Event) -> list[signal.Signals]:
 
 
 async def run_inspection(
-    settings: Settings, stop_event: asyncio.Event | None = None
+    settings: Settings,
+    stop_event: asyncio.Event | None = None,
+    *,
+    resolve: bool = False,
 ) -> None:
     own_stop = stop_event is None
     stop = stop_event if stop_event is not None else asyncio.Event()
@@ -45,11 +50,46 @@ async def run_inspection(
             min_size=settings.pool_min_size,
             max_size=settings.pool_max_size,
             timeout=settings.socket_timeout_seconds,
+            command_timeout=settings.socket_timeout_seconds,
         )
         async with pool.acquire() as conn:
             await conn.fetchval("SELECT 1")
+
+        async def observe(entries: tuple[StreamEntry, ...]) -> None:
+            async with pool.acquire() as conn:
+                async with conn.transaction(isolation="repeatable_read", readonly=True):
+                    results = await resolve_entries(entries, conn)
+            for event in results:
+                log_event(
+                    logger,
+                    "event_relationships",
+                    entry_id=event.source.entry_id,
+                    station_id=event.station_id,
+                    property_id=event.property_id,
+                    reasons=list(event.reasons),
+                )
+                for field in event.fields:
+                    log_event(
+                        logger,
+                        "field_relationship",
+                        entry_id=event.source.entry_id,
+                        local_identifier=field.local_identifier.encode(
+                            "utf-8", errors="backslashreplace"
+                        ).decode("utf-8"),
+                        station_id=field.station_id,
+                        property_id=field.property_id,
+                        sensor_id=field.sensor_id,
+                        sensor_type_id=field.sensor_type_id,
+                        associated=field.associated,
+                        reasons=list(field.reasons),
+                    )
+
         log_event(
-            logger, "inspection_started", stream=settings.stream, writes_enabled=False
+            logger,
+            "inspection_started",
+            stream=settings.stream,
+            writes_enabled=False,
+            resolve_enabled=resolve,
         )
         worker = asyncio.create_task(
             inspect_stream(
@@ -61,6 +101,7 @@ async def run_inspection(
                 retry_initial_seconds=settings.retry_initial_seconds,
                 retry_max_seconds=settings.retry_max_seconds,
                 logger=logger,
+                observer=observe if resolve else None,
             )
         )
         stopper = asyncio.create_task(stop.wait())
@@ -68,6 +109,9 @@ async def run_inspection(
         done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         if worker in done:
             worker.result()
+    except Exception as exc:
+        log_event(logger, "inspection_failed", error_type=type(exc).__name__)
+        raise
     finally:
         for task in tasks:
             task.cancel()

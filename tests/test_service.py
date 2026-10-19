@@ -94,3 +94,78 @@ async def test_signal_registration(monkeypatch):
     assert len(service.install_signal_handlers(asyncio.Event())) == 2
     loop.add_signal_handler.side_effect = NotImplementedError
     assert service.install_signal_handlers(asyncio.Event()) == []
+
+
+def test_cli_resolve(monkeypatch):
+    settings = Settings(_env_file=None, database_url="postgresql://test")
+    monkeypatch.setattr(cli, "Settings", lambda: settings)
+    run = AsyncMock()
+    monkeypatch.setattr(cli, "run_inspection", run)
+    cli.main(["inspect", "--resolve"])
+    run.assert_awaited_once_with(settings, resolve=True)
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_snapshot_and_private_logs(resources, caplog):
+    redis, _, conn, _ = resources
+    stop = asyncio.Event()
+    transaction = Mock()
+    transaction.__aenter__ = AsyncMock()
+    transaction.__aexit__ = AsyncMock()
+    conn.transaction = Mock(return_value=transaction)
+    conn.fetch.side_effect = [
+        [dict(id=1, property_id=2, mac_address="AA:BB:CC:DD:EE:01")],
+        [
+            dict(
+                requested_station_id=1,
+                requested_identifier="temp",
+                station_id=1,
+                sensor_id=3,
+                sensor_type_id=4,
+            )
+        ],
+    ]
+
+    async def read(*a, **k):
+        stop.set()
+        return [
+            (
+                "s",
+                [
+                    (
+                        "1-0",
+                        {
+                            "estacao_id": "1",
+                            "payload": '{"temp":"PRIVATE_MEASUREMENT"}',
+                        },
+                    )
+                ],
+            )
+        ]
+
+    redis.xread.side_effect = read
+    with caplog.at_level(logging.INFO, logger="station_persist"):
+        await service.run_inspection(
+            Settings(_env_file=None, database_url="postgresql://test"),
+            stop,
+            resolve=True,
+        )
+    conn.transaction.assert_called_once_with(isolation="repeatable_read", readonly=True)
+    records = [
+        r.structured_fields for r in caplog.records if r.msg == "field_relationship"
+    ]
+    assert records == [
+        dict(
+            entry_id="1-0",
+            local_identifier="temp",
+            station_id=1,
+            property_id=2,
+            sensor_id=3,
+            sensor_type_id=4,
+            associated=True,
+            reasons=[],
+        )
+    ]
+    assert "PRIVATE_MEASUREMENT" not in repr([r.__dict__ for r in caplog.records])
+    assert all(call[0] in {"ping", "xread", "aclose"} for call in redis.mock_calls)
+    assert not any("execute" in call[0] for call in conn.mock_calls)
