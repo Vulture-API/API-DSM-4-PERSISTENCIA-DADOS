@@ -3,8 +3,10 @@ from __future__ import annotations
 import os
 import socket
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from station_persist.validation import stream_id_parts
 
 
 class Settings(BaseSettings):
@@ -28,6 +30,15 @@ class Settings(BaseSettings):
     retry_max_seconds: float = Field(default=30, gt=0)
     shutdown_timeout_seconds: float = Field(default=10, gt=0)
     log_level: str = "INFO"
+    legacy_max_id: str | None = None
+
+    @field_validator("legacy_max_id", mode="before")
+    @classmethod
+    def validate_legacy_cutoff(cls, value: str | None) -> str | None:
+        if value in (None, ""):
+            return None
+        stream_id_parts(value)
+        return value
 
     @model_validator(mode="after")
     def validate_limits(self) -> Settings:

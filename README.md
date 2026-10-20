@@ -1,8 +1,9 @@
 # Persistência de telemetria — inspeção e relações
 
 Serviço Python 3.12+ independente. Nesta etapa, **apenas inspeciona** o Redis e
-verifica a conexão PostgreSQL com `SELECT 1`; `inspect --resolve` também consulta
-o catálogo para diagnosticar associações (SCRUM-450). Não grava leituras, cria cadastros,
+verifica a conexão PostgreSQL com `SELECT 1`. `inspect --resolve` diagnostica
+associações (SCRUM-450); `inspect --validate` também valida medições e timestamps
+(SCRUM-448), sem escrita. Não grava leituras, cria cadastros,
 confirma mensagens ou altera grupos de consumidores. Não está implantado no INFRA.
 
 [Contrato oficial no Confluence](https://vultureapi.atlassian.net/wiki/spaces/V/pages/46333954).
@@ -44,7 +45,7 @@ retornar esse resultado depois de commit e destino seguro de todas as medições
 padrão, escrita PostgreSQL, recuperação de outros consumidores ou descarte de
 entradas expurgadas. A inspeção não usa esse componente e não modifica a PEL.
 
-Validação: SCRUM-448; associação disponível na biblioteca da SCRUM-450; classificação: SCRUM-449; transações e
+Validação disponível na SCRUM-448; associação disponível na biblioteca da SCRUM-450; classificação: SCRUM-449; transações e
 idempotência: SCRUM-451; recuperação/quarentena/replay: SCRUM-530; substituição
 operacional: SCRUM-531/532. O processo legado não deve ser removido nesta etapa.
 
@@ -139,3 +140,88 @@ Streams/grupos e schemas de catálogo aleatórios e os removem ao final.
 As fixtures reproduzem o subconjunto de colunas e vínculos do BANCO usado pela
 resolução, sem migrations ou alterações no ambiente principal. O CI roda integrações obrigatórias,
 ruff, cobertura mínima de 80%, wheel e build Docker, sem deploy ou publicação.
+
+## Validação de medições e timestamps (SCRUM-448)
+
+```bash
+station-persist inspect --validate
+python -m station_persist inspect --validate
+```
+
+`--validate` inclui resolução de relações, inclusive se combinado com `--resolve`.
+Mantém XREAD desde `0-0`, snapshot `REPEATABLE READ READ ONLY` por lote e os
+mesmos recursos de encerramento/backoff. Erros transitórios repetem o lote sem
+avançar o cursor. Schema/configuração inválidos encerram explicitamente.
+Nenhum grupo, pendência, XACK, ocorrência, leitura ou quarentena é alterado.
+
+A biblioteca `station_persist.validation.validate_entries(entries, connection,
+legacy_max_id=None)` recebe as entradas originais. `legacy_max_id` é argumento
+nomeado; o chamador controla conexão/transação. Use a mesma transação para
+resolver relações e consultar limites. Não há cache persistente.
+
+`EventValidation` conserva `resolution`, `timestamp` e `fields`. O timestamp
+informa segundos efetivos, received_at original em ms, origem, motivos e avisos.
+Cada `MeasurementValidation` conserva a resolução original, valor decimal exato,
+limites consultados, motivos e status `valid`, `out_of_range` ou `rejected`.
+**Validação não é persistência nem autoriza confirmação.** Valores fora da faixa
+ficam disponíveis para as SCRUM-449/451; rejeições alimentam as SCRUM-449/530.
+
+- Aceita inteiros JSON e decimais como `Decimal`, sem conversão para float,
+  arredondamento ou calibração. Booleanos, textos, null, listas/objetos e valores
+  não finitos são rejeitados como medições. Tokens com expoente maior que a
+  capacidade de Decimal são preservados como `UnrepresentableNumber` e rejeitados
+  individualmente, sem invalidar outras medições.
+- `NUMERIC` PostgreSQL sem escala fixa comporta até 131072 dígitos integrais e
+  16383 fracionários. A validação calcula a representabilidade sem expandir
+  expoentes nem aplicar o arredondamento do contexto Decimal. Zeros finais podem
+  ser removidos do valor preparado sem perda numérica; o token original permanece
+  em `resolution.source.fields['payload']`.
+- Limites inclusivos: `below_min`/`above_max` indicam `out_of_range`; igualdade é
+  válida e um lado NULL não restringe. Tipos indevidos geram
+  `invalid_numeric_type`; não finitos, `non_finite_value`; excesso de capacidade,
+  `numeric_not_representable`. Motivos de associação da SCRUM-450 são preservados.
+- O schema deve conter `readings.value` e `sensors.min_value/max_value` como
+  NUMERIC sem escala fixa: **aplicar a migration 016 do BANCO antes de usar o
+  diagnóstico**. Não é aplicada pelo serviço. Colunas ausentes, precisão antiga,
+  limites invertidos/não finitos são erros de configuração, nunca limites ausentes.
+  Catálogo alterado entre consultas sem snapshot gera erro técnico recuperável.
+
+### Timestamps e corte legado
+
+A fonte de `unix_time` é o payload, não o campo extraído do Stream. Exige token
+inteiro JSON não negativo; textos, booleanos, null, `1.0` e `1e0` não são inteiros
+JSON aceitos. O intervalo UTC suportado pelo serviço é de 0 a 253402300799 segundos
+(1970 até o fim de 9999), dentro de BIGINT. Não existe janela de atraso/futuro.
+`received_at` é obrigatório, inteiro textual não negativo em ms, até
+253402300799999. Ausência/invalidez gera `invalid_received_at` ou
+`received_at_not_representable`; timestamp informado incorretamente gera
+`invalid_timestamp_type` ou `timestamp_not_representable`.
+
+Timestamp ausente usa `received_at // 1000`, com origem `received_at`. Timestamp
+válido usa origem `payload`. Nunca se consulta o relógio do processamento.
+
+`PERSIST_LEGACY_MAX_ID` é opcional e vazio por padrão. É um ID Redis completo,
+com dois inteiros uint64, comparados numericamente e com limite inclusivo. Vale
+somente para o `PERSIST_STREAM` configurado. O operador deve registrar o último ID
+gerado pelo receptor antigo durante uma transição com ele parado, antes de ativar
+o receptor novo. Não deduzir esse corte por payload nem copiar entre Streams.
+
+Dentro do corte, payload `unix_time: null` junto do campo extraído `unix_time`
+igual ao texto `null` permite usar received_at com origem `legacy_received_at` e
+aviso `legacy_timestamp_original_lost`. O valor original não pode ser reconstruído.
+Fora do corte, ou sem configuração, null explícito é rejeitado. Timestamp inválido
+compartilhado rejeita as medições do evento; valor inválido em um sensor não afeta
+os demais. O resultado preserva todas as entradas para seu destino futuro.
+
+Logs de validação mostram IDs, status, timestamp efetivo, origem e motivos/avisos;
+não incluem valores das medições, limites ou payload completo. A inspeção padrão
+e `--resolve` continuam disponíveis.
+
+### Limite da garantia de precisão
+
+A precisão é preservada no tratamento e no armazenamento NUMERIC. A migration
+não recupera casas já arredondadas no histórico. As APIs existentes continuam
+usando números JavaScript e conversões float8, incluindo estatísticas arredondadas:
+não oferecem precisão decimal exata nem suporte equivalente a valores extremos.
+Este PR não muda seu contrato HTTP. Validar essa compatibilidade antes de habilitar
+a persistência definitiva em produção (SCRUM-451/531).
