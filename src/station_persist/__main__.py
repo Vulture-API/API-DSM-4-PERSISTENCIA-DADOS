@@ -16,12 +16,19 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="Diagnose catalog associations (read-only)",
     )
+    parser.add_argument(
+        "--validate",
+        action="store_true",
+        help="Validate telemetry (read-only, includes resolution)",
+    )
     args = parser.parse_args(argv)
     settings = Settings()
     configure_logging(settings.log_level)
     try:
         asyncio.run(
-            run_inspection(settings, resolve=True)
+            run_inspection(settings, validate=True)
+            if args.validate
+            else run_inspection(settings, resolve=True)
             if args.resolve
             else run_inspection(settings)
         )

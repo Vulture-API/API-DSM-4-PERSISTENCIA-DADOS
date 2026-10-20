@@ -12,6 +12,7 @@ from station_persist.inspection import inspect_stream
 from station_persist.logging_config import log_event
 from station_persist.relationships import resolve_entries
 from station_persist.stream import StreamEntry
+from station_persist.validation import validate_entries
 
 
 def install_signal_handlers(stop: asyncio.Event) -> list[signal.Signals]:
@@ -30,6 +31,7 @@ async def run_inspection(
     stop_event: asyncio.Event | None = None,
     *,
     resolve: bool = False,
+    validate: bool = False,
 ) -> None:
     own_stop = stop_event is None
     stop = stop_event if stop_event is not None else asyncio.Event()
@@ -58,7 +60,34 @@ async def run_inspection(
         async def observe(entries: tuple[StreamEntry, ...]) -> None:
             async with pool.acquire() as conn:
                 async with conn.transaction(isolation="repeatable_read", readonly=True):
-                    results = await resolve_entries(entries, conn)
+                    if validate:
+                        validations = await validate_entries(
+                            entries, conn, legacy_max_id=settings.legacy_max_id
+                        )
+                        results = tuple(event.resolution for event in validations)
+                    else:
+                        results = await resolve_entries(entries, conn)
+            if validate:
+                for event in validations:
+                    log_event(
+                        logger,
+                        "event_validation",
+                        entry_id=event.resolution.source.entry_id,
+                        unix_time=event.timestamp.unix_time,
+                        timestamp_source=event.timestamp.source,
+                        reasons=list(event.reasons),
+                        warnings=list(event.timestamp.warnings),
+                    )
+                    for field in event.fields:
+                        log_event(
+                            logger,
+                            "measurement_validation",
+                            entry_id=event.resolution.source.entry_id,
+                            sensor_id=field.resolution.sensor_id,
+                            station_id=field.resolution.station_id,
+                            status=field.status,
+                            reasons=list(field.reasons),
+                        )
             for event in results:
                 log_event(
                     logger,
@@ -90,6 +119,7 @@ async def run_inspection(
             stream=settings.stream,
             writes_enabled=False,
             resolve_enabled=resolve,
+            validate_enabled=validate,
         )
         worker = asyncio.create_task(
             inspect_stream(
@@ -101,7 +131,7 @@ async def run_inspection(
                 retry_initial_seconds=settings.retry_initial_seconds,
                 retry_max_seconds=settings.retry_max_seconds,
                 logger=logger,
-                observer=observe if resolve else None,
+                observer=observe if resolve or validate else None,
             )
         )
         stopper = asyncio.create_task(stop.wait())

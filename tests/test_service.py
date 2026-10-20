@@ -169,3 +169,12 @@ async def test_diagnostic_snapshot_and_private_logs(resources, caplog):
     assert "PRIVATE_MEASUREMENT" not in repr([r.__dict__ for r in caplog.records])
     assert all(call[0] in {"ping", "xread", "aclose"} for call in redis.mock_calls)
     assert not any("execute" in call[0] for call in conn.mock_calls)
+
+
+def test_cli_validate_includes_resolution(monkeypatch):
+    settings = Settings(_env_file=None, database_url="postgresql://test")
+    monkeypatch.setattr(cli, "Settings", lambda: settings)
+    run = AsyncMock()
+    monkeypatch.setattr(cli, "run_inspection", run)
+    cli.main(["inspect", "--validate", "--resolve"])
+    run.assert_awaited_once_with(settings, validate=True)
