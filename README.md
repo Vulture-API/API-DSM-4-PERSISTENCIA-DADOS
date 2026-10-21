@@ -225,3 +225,104 @@ usando números JavaScript e conversões float8, incluindo estatísticas arredon
 não oferecem precisão decimal exata nem suporte equivalente a valores extremos.
 Este PR não muda seu contrato HTTP. Validar essa compatibilidade antes de habilitar
 a persistência definitiva em produção (SCRUM-451/531).
+
+## Destinos das medições — SCRUM-449
+
+`build_processing_plan(EventValidation)` é uma função sem escrita. Conserva a
+validação/origem e classifica cada campo como `reading`, `inconsistent` ou
+`quarantine`. A posição do campo identifica o resultado; a posição zero representa
+uma rejeição do evento inteiro, inclusive payload sem campos associáveis.
+Uma rejeição individual não impede o destino dos outros campos. O plano não é
+`ProcessingResult.COMPLETED` e nunca autoriza ACK.
+
+A SCRUM-451 integra esses destinos em uma transação PostgreSQL: leituras fora dos
+limites mantêm o valor exato e `data_consistent=false`, com ocorrência
+`OUT_OF_RANGE` (no máximo uma aberta por sensor). Não depender do monitor do
+BACKEND: ele ignora leituras já inconsistentes. Rejeições preservam a origem em
+quarentena, e valores conflitantes para o mesmo sensor/instante não sobrescrevem
+a primeira leitura. Recuperação entre consumidores e replay operacional são
+responsabilidade da SCRUM-530. O aceite integrado depende da SCRUM-451.
+
+## Consumo transacional optativo — SCRUM-451
+
+```bash
+# Apply BANCO schema/migrations explicitly first, only in the intended database.
+# Both historical 016 migrations and 017 are required.
+export PERSIST_SOURCE_ID=vulture-local-telemetry
+station-persist consume
+# equivalent:
+python -m station_persist consume
+```
+
+`consume` writes; the default remains `inspect` (read-only). Do not run the new
+consumer beside `recepcao-persist` against the same database. Deployment and the
+operational replacement belong to SCRUM-531. No migration is run by this package.
+Startup verifies storage columns, exact NUMERIC types and required unique indexes
+before creating a consumer group. `--resolve`/`--validate` remain inspection flags.
+
+`process_entry(entry, pool, *, source_id, stream, legacy_max_id=None)` owns one
+`REPEATABLE READ` transaction. It registers the source, calls the SCRUM-448
+validator, locks associated station/sensor rows, writes all destinations, updates
+communication and marks completion. `ProcessingResult.COMPLETED` is returned only
+after the transaction context has committed; only then may GroupConsumer XACK.
+Technical failures roll back all destinations; ambiguous commit and cancellation
+leave the entry unacknowledged. Transient errors retry the entire transaction.
+
+The BANCO migration adds `telemetry_events`, `telemetry_results` and
+`telemetry_quarantine`. Events store **all original Redis string fields** as
+ASCII-escaped JSON bytes in BYTEA. This is an envelope representation, not a
+parse/rewrite of the payload: `json.loads(original_fields)` reconstructs the
+original field strings, including arbitrary numeric tokens, malformed payloads,
+NUL and lone surrogates. Quarantine joins the event for its topic, received_at,
+payload and identity; it stores ordinal (zero = event rejection), reasons, OPEN
+state and registration time. Individual field ordinals follow payload order.
+No automatic cleanup or deletion of these audit records is implemented.
+
+Idempotency has two independent levels:
+
+- `(PERSIST_SOURCE_ID, PERSIST_STREAM, Redis entry ID)` is unique. Keep SOURCE_ID
+  stable through restarts; consumer names are not part of this identity. A
+  completed entry with identical original fields is a no-op. Reused identity
+  with changed content raises SourceIdentityError and receives no ACK. Changing
+  SOURCE_ID is an explicit operator decision when replacing/restoring a source
+  history that can reuse Redis IDs; it is not a workaround for normal replay.
+- `(sensor_id, unix_time)` is unique in readings, including partitions. The same
+  exact Decimal value reuses the reading; a different value creates quarantine
+  reason `conflicting_measurement`. The first committed reading retains value
+  and consistency; later limit changes do not silently reclassify duplicates.
+
+MQTT redelivery with different Redis IDs is deduplicated when the effective sensor
+and measurement second are the same. Without a publisher timestamp, a new receipt
+in another second can produce another measurement time: the current protocol has
+no durable publisher event ID to identify those messages as the same measurement.
+
+New out-of-range readings preserve exact value and `data_consistent=false` and
+insert OUT_OF_RANGE directly, respecting the existing partial unique index for
+one OPEN occurrence per sensor. Repeating a reading never reopens a resolved
+occurrence. Occurrence values use unconstrained NUMERIC; descriptions avoid
+expanding huge numbers. API float8/JavaScript limitations remain unchanged.
+
+Communication uses original received_at milliseconds in UTC and GREATEST, so
+late deliveries cannot regress stations.last_communication_at. A safely resolved
+station with valid receipt can update communication even if its measurements
+are rejected. Measurement time, missing timestamp fallback and the configured
+inclusive legacy cutoff retain SCRUM-448 rules. Empty Redis entries (e.g. trimmed
+pending entries) fail explicitly and remain pending rather than being auto-ACKed.
+
+The consumer starts its group at 0-0 and drains **its own pending entries** before
+new entries. Use a stable PERSIST_CONSUMER to resume that identity. It does not
+claim another consumer's pending entries; cross-consumer recovery, controlled
+quarantine replay, retention and complete operational metrics remain SCRUM-530.
+On SIGINT/SIGTERM it stops admitting work and drains the active transaction up to
+PERSIST_SHUTDOWN_TIMEOUT_SECONDS, then cancels and closes resources. Logs report
+IDs, counts, duplicate/conflict quarantine totals and commit latency, without
+measurement values or complete payloads.
+
+### Integration tests with the real BANCO contract
+
+The persistence tests read the versioned schema and migrations from the sibling
+BANCO checkout (override with BANCO_SCHEMA_DIR). This is a **test-only dependency**;
+the installed package/image never imports or reads another repository at runtime.
+CI checks out a pinned BANCO revision with migration 017 and fails if any required
+integration is skipped. Use RUN_INTEGRATION=1, TEST_DATABASE_URL and TEST_REDIS_URL
+against disposable services only.
