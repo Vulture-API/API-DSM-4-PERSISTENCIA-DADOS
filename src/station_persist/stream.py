@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
@@ -41,6 +42,7 @@ class GroupConsumer:
         batch_size: int = 500,
         block_ms: int = 1000,
         processor: Processor | None = None,
+        stop_event: asyncio.Event | None = None,
     ) -> None:
         if processor is None:
             raise ValueError(
@@ -50,6 +52,7 @@ class GroupConsumer:
         self.group, self.consumer = group, consumer
         self.batch_size, self.block_ms = batch_size, block_ms
         self.processor = processor
+        self.stop_event = stop_event
 
     async def ensure_group(self) -> None:
         try:
@@ -71,6 +74,8 @@ class GroupConsumer:
         confirmed = 0
         for _stream, messages in response or []:
             for entry_id, fields in messages:
+                if self.stop_event is not None and self.stop_event.is_set():
+                    return confirmed
                 outcome = await self.processor(StreamEntry.from_redis(entry_id, fields))
                 if outcome is ProcessingResult.COMPLETED:
                     await self.redis.xack(self.stream, self.group, entry_id)

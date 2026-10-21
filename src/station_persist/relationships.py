@@ -7,7 +7,7 @@ import re
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from decimal import Decimal
+from decimal import Decimal, DecimalException
 from enum import StrEnum
 from typing import Any, Protocol
 
@@ -70,6 +70,17 @@ _MAC = re.compile(r"[0-9A-F]{2}([:-]?)(?:[0-9A-F]{2}\1){4}[0-9A-F]{2}")
 _RESERVED = frozenset({"estacao_id", "unix_time"})
 
 
+class UnrepresentableNumber(str):
+    """Original numeric JSON token beyond even Decimal's exponent capacity."""
+
+
+def parse_json_decimal(token: str) -> Decimal | UnrepresentableNumber:
+    try:
+        return Decimal(token)
+    except DecimalException:
+        return UnrepresentableNumber(token)
+
+
 def _mac_identity(value: str) -> StationIdentity | None:
     if _MAC.fullmatch(value):
         return StationIdentity("mac", value.replace(":", "").replace("-", ""))
@@ -124,7 +135,7 @@ def _prepare(entry: StreamEntry) -> tuple[EventResolution, StationIdentity | Non
     try:
         payload = json.loads(
             entry.fields["payload"],
-            parse_float=Decimal,
+            parse_float=parse_json_decimal,
             parse_int=_integer,
             parse_constant=_invalid_constant,
             object_pairs_hook=_json_object,

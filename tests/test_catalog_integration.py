@@ -45,18 +45,19 @@ async def catalog():
                 station_id integer NOT NULL REFERENCES stations,
                 sensor_type_id integer NOT NULL REFERENCES sensor_types,
                 local_identifier varchar(50) NOT NULL,
+                min_value numeric NULL, max_value numeric NULL,
                 UNIQUE(station_id, local_identifier)
             );
             CREATE TABLE readings(
                 id bigint PRIMARY KEY,
                 sensor_id integer NOT NULL REFERENCES sensors,
-                value decimal(10,2), unix_time bigint, data_consistent boolean
+                value numeric, unix_time bigint, data_consistent boolean
             );
             INSERT INTO properties VALUES (10), (11);
             INSERT INTO stations VALUES
                 (1,10,'AA:BB:CC:DD:EE:01'), (2,11,'AA:BB:CC:DD:EE:02');
             INSERT INTO sensor_types VALUES (100), (101);
-            INSERT INTO sensors VALUES
+            INSERT INTO sensors(id,station_id,sensor_type_id,local_identifier) VALUES
                 (20,1,100,'temp'), (21,1,101,'humidity'), (22,1,100,'meta'),
                 (30,2,100,'temp'), (31,2,101,'only_there'),
                 (40,1,100,'Case'), (41,1,100,'case');
@@ -309,7 +310,9 @@ async def test_real_diagnostic_backlog_follow_shutdown_no_writes_ack_or_groups(
 async def test_real_numeric_mac_catalog_column_does_not_become_legacy_id(catalog):
     conn, _ = catalog
     await conn.execute("INSERT INTO stations VALUES (3,10,'001122334455')")
-    await conn.execute("INSERT INTO sensors VALUES (50,3,100,'temp')")
+    await conn.execute(
+        "INSERT INTO sensors(id,station_id,sensor_type_id,local_identifier) VALUES (50,3,100,'temp')"
+    )
     mac, numeric = await resolve_entries(
         [event("00:11:22:33:44:55"), event("001122334455")], conn
     )

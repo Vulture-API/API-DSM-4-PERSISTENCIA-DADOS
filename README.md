@@ -1,8 +1,9 @@
 # Persistência de telemetria — inspeção e relações
 
 Serviço Python 3.12+ independente. Nesta etapa, **apenas inspeciona** o Redis e
-verifica a conexão PostgreSQL com `SELECT 1`; `inspect --resolve` também consulta
-o catálogo para diagnosticar associações (SCRUM-450). Não grava leituras, cria cadastros,
+verifica a conexão PostgreSQL com `SELECT 1`. `inspect --resolve` diagnostica
+associações (SCRUM-450); `inspect --validate` também valida medições e timestamps
+(SCRUM-448), sem escrita. Não grava leituras, cria cadastros,
 confirma mensagens ou altera grupos de consumidores. Não está implantado no INFRA.
 
 [Contrato oficial no Confluence](https://vultureapi.atlassian.net/wiki/spaces/V/pages/46333954).
@@ -44,7 +45,7 @@ retornar esse resultado depois de commit e destino seguro de todas as medições
 padrão, escrita PostgreSQL, recuperação de outros consumidores ou descarte de
 entradas expurgadas. A inspeção não usa esse componente e não modifica a PEL.
 
-Validação: SCRUM-448; associação disponível na biblioteca da SCRUM-450; classificação: SCRUM-449; transações e
+Validação disponível na SCRUM-448; associação disponível na biblioteca da SCRUM-450; classificação: SCRUM-449; transações e
 idempotência: SCRUM-451; recuperação/quarentena/replay: SCRUM-530; substituição
 operacional: SCRUM-531/532. O processo legado não deve ser removido nesta etapa.
 
@@ -139,3 +140,189 @@ Streams/grupos e schemas de catálogo aleatórios e os removem ao final.
 As fixtures reproduzem o subconjunto de colunas e vínculos do BANCO usado pela
 resolução, sem migrations ou alterações no ambiente principal. O CI roda integrações obrigatórias,
 ruff, cobertura mínima de 80%, wheel e build Docker, sem deploy ou publicação.
+
+## Validação de medições e timestamps (SCRUM-448)
+
+```bash
+station-persist inspect --validate
+python -m station_persist inspect --validate
+```
+
+`--validate` inclui resolução de relações, inclusive se combinado com `--resolve`.
+Mantém XREAD desde `0-0`, snapshot `REPEATABLE READ READ ONLY` por lote e os
+mesmos recursos de encerramento/backoff. Erros transitórios repetem o lote sem
+avançar o cursor. Schema/configuração inválidos encerram explicitamente.
+Nenhum grupo, pendência, XACK, ocorrência, leitura ou quarentena é alterado.
+
+A biblioteca `station_persist.validation.validate_entries(entries, connection,
+legacy_max_id=None)` recebe as entradas originais. `legacy_max_id` é argumento
+nomeado; o chamador controla conexão/transação. Use a mesma transação para
+resolver relações e consultar limites. Não há cache persistente.
+
+`EventValidation` conserva `resolution`, `timestamp` e `fields`. O timestamp
+informa segundos efetivos, received_at original em ms, origem, motivos e avisos.
+Cada `MeasurementValidation` conserva a resolução original, valor decimal exato,
+limites consultados, motivos e status `valid`, `out_of_range` ou `rejected`.
+**Validação não é persistência nem autoriza confirmação.** Valores fora da faixa
+ficam disponíveis para as SCRUM-449/451; rejeições alimentam as SCRUM-449/530.
+
+- Aceita inteiros JSON e decimais como `Decimal`, sem conversão para float,
+  arredondamento ou calibração. Booleanos, textos, null, listas/objetos e valores
+  não finitos são rejeitados como medições. Tokens com expoente maior que a
+  capacidade de Decimal são preservados como `UnrepresentableNumber` e rejeitados
+  individualmente, sem invalidar outras medições.
+- `NUMERIC` PostgreSQL sem escala fixa comporta até 131072 dígitos integrais e
+  16383 fracionários. A validação calcula a representabilidade sem expandir
+  expoentes nem aplicar o arredondamento do contexto Decimal. Zeros finais podem
+  ser removidos do valor preparado sem perda numérica; o token original permanece
+  em `resolution.source.fields['payload']`.
+- Limites inclusivos: `below_min`/`above_max` indicam `out_of_range`; igualdade é
+  válida e um lado NULL não restringe. Tipos indevidos geram
+  `invalid_numeric_type`; não finitos, `non_finite_value`; excesso de capacidade,
+  `numeric_not_representable`. Motivos de associação da SCRUM-450 são preservados.
+- O schema deve conter `readings.value` e `sensors.min_value/max_value` como
+  NUMERIC sem escala fixa: **aplicar a migration 016 do BANCO antes de usar o
+  diagnóstico**. Não é aplicada pelo serviço. Colunas ausentes, precisão antiga,
+  limites invertidos/não finitos são erros de configuração, nunca limites ausentes.
+  Catálogo alterado entre consultas sem snapshot gera erro técnico recuperável.
+
+### Timestamps e corte legado
+
+A fonte de `unix_time` é o payload, não o campo extraído do Stream. Exige token
+inteiro JSON não negativo; textos, booleanos, null, `1.0` e `1e0` não são inteiros
+JSON aceitos. O intervalo UTC suportado pelo serviço é de 0 a 253402300799 segundos
+(1970 até o fim de 9999), dentro de BIGINT. Não existe janela de atraso/futuro.
+`received_at` é obrigatório, inteiro textual não negativo em ms, até
+253402300799999. Ausência/invalidez gera `invalid_received_at` ou
+`received_at_not_representable`; timestamp informado incorretamente gera
+`invalid_timestamp_type` ou `timestamp_not_representable`.
+
+Timestamp ausente usa `received_at // 1000`, com origem `received_at`. Timestamp
+válido usa origem `payload`. Nunca se consulta o relógio do processamento.
+
+`PERSIST_LEGACY_MAX_ID` é opcional e vazio por padrão. É um ID Redis completo,
+com dois inteiros uint64, comparados numericamente e com limite inclusivo. Vale
+somente para o `PERSIST_STREAM` configurado. O operador deve registrar o último ID
+gerado pelo receptor antigo durante uma transição com ele parado, antes de ativar
+o receptor novo. Não deduzir esse corte por payload nem copiar entre Streams.
+
+Dentro do corte, payload `unix_time: null` junto do campo extraído `unix_time`
+igual ao texto `null` permite usar received_at com origem `legacy_received_at` e
+aviso `legacy_timestamp_original_lost`. O valor original não pode ser reconstruído.
+Fora do corte, ou sem configuração, null explícito é rejeitado. Timestamp inválido
+compartilhado rejeita as medições do evento; valor inválido em um sensor não afeta
+os demais. O resultado preserva todas as entradas para seu destino futuro.
+
+Logs de validação mostram IDs, status, timestamp efetivo, origem e motivos/avisos;
+não incluem valores das medições, limites ou payload completo. A inspeção padrão
+e `--resolve` continuam disponíveis.
+
+### Limite da garantia de precisão
+
+A precisão é preservada no tratamento e no armazenamento NUMERIC. A migration
+não recupera casas já arredondadas no histórico. As APIs existentes continuam
+usando números JavaScript e conversões float8, incluindo estatísticas arredondadas:
+não oferecem precisão decimal exata nem suporte equivalente a valores extremos.
+Este PR não muda seu contrato HTTP. Validar essa compatibilidade antes de habilitar
+a persistência definitiva em produção (SCRUM-451/531).
+
+## Destinos das medições — SCRUM-449
+
+`build_processing_plan(EventValidation)` é uma função sem escrita. Conserva a
+validação/origem e classifica cada campo como `reading`, `inconsistent` ou
+`quarantine`. A posição do campo identifica o resultado; a posição zero representa
+uma rejeição do evento inteiro, inclusive payload sem campos associáveis.
+Uma rejeição individual não impede o destino dos outros campos. O plano não é
+`ProcessingResult.COMPLETED` e nunca autoriza ACK.
+
+A SCRUM-451 integra esses destinos em uma transação PostgreSQL: leituras fora dos
+limites mantêm o valor exato e `data_consistent=false`, com ocorrência
+`OUT_OF_RANGE` (no máximo uma aberta por sensor). Não depender do monitor do
+BACKEND: ele ignora leituras já inconsistentes. Rejeições preservam a origem em
+quarentena, e valores conflitantes para o mesmo sensor/instante não sobrescrevem
+a primeira leitura. Recuperação entre consumidores e replay operacional são
+responsabilidade da SCRUM-530. O aceite integrado depende da SCRUM-451.
+
+## Consumo transacional optativo — SCRUM-451
+
+```bash
+# Apply BANCO schema/migrations explicitly first, only in the intended database.
+# Both historical 016 migrations and 017 are required.
+export PERSIST_SOURCE_ID=vulture-local-telemetry
+station-persist consume
+# equivalent:
+python -m station_persist consume
+```
+
+`consume` writes; the default remains `inspect` (read-only). Do not run the new
+consumer beside `recepcao-persist` against the same database. Deployment and the
+operational replacement belong to SCRUM-531. No migration is run by this package.
+Startup verifies storage columns, exact NUMERIC types and required unique indexes
+before creating a consumer group. `--resolve`/`--validate` remain inspection flags.
+
+`process_entry(entry, pool, *, source_id, stream, legacy_max_id=None)` owns one
+`REPEATABLE READ` transaction. It registers the source, calls the SCRUM-448
+validator, locks associated station/sensor rows, writes all destinations, updates
+communication and marks completion. `ProcessingResult.COMPLETED` is returned only
+after the transaction context has committed; only then may GroupConsumer XACK.
+Technical failures roll back all destinations; ambiguous commit and cancellation
+leave the entry unacknowledged. Transient errors retry the entire transaction.
+
+The BANCO migration adds `telemetry_events`, `telemetry_results` and
+`telemetry_quarantine`. Events store **all original Redis string fields** as
+ASCII-escaped JSON bytes in BYTEA. This is an envelope representation, not a
+parse/rewrite of the payload: `json.loads(original_fields)` reconstructs the
+original field strings, including arbitrary numeric tokens, malformed payloads,
+NUL and lone surrogates. Quarantine joins the event for its topic, received_at,
+payload and identity; it stores ordinal (zero = event rejection), reasons, OPEN
+state and registration time. Individual field ordinals follow payload order.
+No automatic cleanup or deletion of these audit records is implemented.
+
+Idempotency has two independent levels:
+
+- `(PERSIST_SOURCE_ID, PERSIST_STREAM, Redis entry ID)` is unique. Keep SOURCE_ID
+  stable through restarts; consumer names are not part of this identity. A
+  completed entry with identical original fields is a no-op. Reused identity
+  with changed content raises SourceIdentityError and receives no ACK. Changing
+  SOURCE_ID is an explicit operator decision when replacing/restoring a source
+  history that can reuse Redis IDs; it is not a workaround for normal replay.
+- `(sensor_id, unix_time)` is unique in readings, including partitions. The same
+  exact Decimal value reuses the reading; a different value creates quarantine
+  reason `conflicting_measurement`. The first committed reading retains value
+  and consistency; later limit changes do not silently reclassify duplicates.
+
+MQTT redelivery with different Redis IDs is deduplicated when the effective sensor
+and measurement second are the same. Without a publisher timestamp, a new receipt
+in another second can produce another measurement time: the current protocol has
+no durable publisher event ID to identify those messages as the same measurement.
+
+New out-of-range readings preserve exact value and `data_consistent=false` and
+insert OUT_OF_RANGE directly, respecting the existing partial unique index for
+one OPEN occurrence per sensor. Repeating a reading never reopens a resolved
+occurrence. Occurrence values use unconstrained NUMERIC; descriptions avoid
+expanding huge numbers. API float8/JavaScript limitations remain unchanged.
+
+Communication uses original received_at milliseconds in UTC and GREATEST, so
+late deliveries cannot regress stations.last_communication_at. A safely resolved
+station with valid receipt can update communication even if its measurements
+are rejected. Measurement time, missing timestamp fallback and the configured
+inclusive legacy cutoff retain SCRUM-448 rules. Empty Redis entries (e.g. trimmed
+pending entries) fail explicitly and remain pending rather than being auto-ACKed.
+
+The consumer starts its group at 0-0 and drains **its own pending entries** before
+new entries. Use a stable PERSIST_CONSUMER to resume that identity. It does not
+claim another consumer's pending entries; cross-consumer recovery, controlled
+quarantine replay, retention and complete operational metrics remain SCRUM-530.
+On SIGINT/SIGTERM it stops admitting work and drains the active transaction up to
+PERSIST_SHUTDOWN_TIMEOUT_SECONDS, then cancels and closes resources. Logs report
+IDs, counts, duplicate/conflict quarantine totals and commit latency, without
+measurement values or complete payloads.
+
+### Integration tests with the real BANCO contract
+
+The persistence tests read the versioned schema and migrations from the sibling
+BANCO checkout (override with BANCO_SCHEMA_DIR). This is a **test-only dependency**;
+the installed package/image never imports or reads another repository at runtime.
+CI checks out a pinned BANCO revision with migration 017 and fails if any required
+integration is skipped. Use RUN_INTEGRATION=1, TEST_DATABASE_URL and TEST_REDIS_URL
+against disposable services only.
