@@ -36,8 +36,16 @@ jobs:
       RUN_INTEGRATION: '1'
       TEST_REDIS_URL: redis://127.0.0.1:6379/15
       TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/telemetry_test
+      BANCO_SCHEMA_DIR: ${{ github.workspace }}/contracts/banco
     steps:
       - uses: actions/checkout@v4
+      - name: Checkout versioned BANCO contract (SCRUM-451)
+        uses: actions/checkout@v4
+        with:
+          repository: Vulture-API/API-DSM-4-BANCO
+          ref: a3affcd640200d2aa27d3e7bb61bc4121b4edd94
+          path: contracts/banco
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
