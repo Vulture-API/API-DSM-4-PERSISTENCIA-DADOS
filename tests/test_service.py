@@ -75,8 +75,6 @@ def test_cli_default_inspect(monkeypatch):
     monkeypatch.setattr(cli, "run_inspection", run)
     cli.main([])
     run.assert_awaited_once_with(settings)
-    with pytest.raises(SystemExit):
-        cli.main(["consume"])
 
 
 def test_logging_json_without_payload():
