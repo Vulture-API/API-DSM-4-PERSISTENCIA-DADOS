@@ -225,3 +225,20 @@ usando números JavaScript e conversões float8, incluindo estatísticas arredon
 não oferecem precisão decimal exata nem suporte equivalente a valores extremos.
 Este PR não muda seu contrato HTTP. Validar essa compatibilidade antes de habilitar
 a persistência definitiva em produção (SCRUM-451/531).
+
+## Destinos das medições — SCRUM-449
+
+`build_processing_plan(EventValidation)` é uma função sem escrita. Conserva a
+validação/origem e classifica cada campo como `reading`, `inconsistent` ou
+`quarantine`. A posição do campo identifica o resultado; a posição zero representa
+uma rejeição do evento inteiro, inclusive payload sem campos associáveis.
+Uma rejeição individual não impede o destino dos outros campos. O plano não é
+`ProcessingResult.COMPLETED` e nunca autoriza ACK.
+
+A SCRUM-451 integra esses destinos em uma transação PostgreSQL: leituras fora dos
+limites mantêm o valor exato e `data_consistent=false`, com ocorrência
+`OUT_OF_RANGE` (no máximo uma aberta por sensor). Não depender do monitor do
+BACKEND: ele ignora leituras já inconsistentes. Rejeições preservam a origem em
+quarentena, e valores conflitantes para o mesmo sensor/instante não sobrescrevem
+a primeira leitura. Recuperação entre consumidores e replay operacional são
+responsabilidade da SCRUM-530. O aceite integrado depende da SCRUM-451.
