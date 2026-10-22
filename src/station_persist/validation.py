@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import StrEnum
@@ -171,6 +171,7 @@ async def validate_entries(
     connection: CatalogConnection,
     *,
     legacy_max_id: str | None = None,
+    timestamp_overrides: Mapping[str, TimestampValidation] | None = None,
 ) -> tuple[EventValidation, ...]:
     """Caller owns connection/transaction. Prefer REPEATABLE READ for a whole batch."""
     cutoff = stream_id_parts(legacy_max_id) if legacy_max_id is not None else None
@@ -228,7 +229,8 @@ async def validate_entries(
     events = []
     for event in resolved:
         time = (
-            _timestamp(event.source, cutoff)
+            (timestamp_overrides or {}).get(event.source.entry_id)
+            or _timestamp(event.source, cutoff)
             if not event.reasons
             else TimestampValidation()
         )

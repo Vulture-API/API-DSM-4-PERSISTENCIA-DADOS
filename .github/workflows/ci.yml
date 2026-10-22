@@ -39,11 +39,11 @@ jobs:
       BANCO_SCHEMA_DIR: ${{ github.workspace }}/contracts/banco
     steps:
       - uses: actions/checkout@v4
-      - name: Checkout versioned BANCO contract (SCRUM-451)
+      - name: Checkout versioned BANCO contract (SCRUM-530)
         uses: actions/checkout@v4
         with:
           repository: Vulture-API/API-DSM-4-BANCO
-          ref: a3affcd640200d2aa27d3e7bb61bc4121b4edd94
+          ref: 122afee72bee9201dcd58e9349aa2423dd3951a4
           path: contracts/banco
           persist-credentials: false
       - uses: actions/setup-python@v5

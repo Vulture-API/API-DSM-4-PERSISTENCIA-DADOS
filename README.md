@@ -240,14 +240,13 @@ limites mantêm o valor exato e `data_consistent=false`, com ocorrência
 `OUT_OF_RANGE` (no máximo uma aberta por sensor). Não depender do monitor do
 BACKEND: ele ignora leituras já inconsistentes. Rejeições preservam a origem em
 quarentena, e valores conflitantes para o mesmo sensor/instante não sobrescrevem
-a primeira leitura. Recuperação entre consumidores e replay operacional são
-responsabilidade da SCRUM-530. O aceite integrado depende da SCRUM-451.
+a primeira leitura. Recuperação e replay operacional são descritos abaixo, na SCRUM-530.
 
 ## Consumo transacional optativo — SCRUM-451
 
 ```bash
 # Apply BANCO schema/migrations explicitly first, only in the intended database.
-# Both historical 016 migrations and 017 are required.
+# Both historical 016 migrations, 017 and 018 are required.
 export PERSIST_SOURCE_ID=vulture-local-telemetry
 station-persist consume
 # equivalent:
@@ -307,12 +306,11 @@ late deliveries cannot regress stations.last_communication_at. A safely resolved
 station with valid receipt can update communication even if its measurements
 are rejected. Measurement time, missing timestamp fallback and the configured
 inclusive legacy cutoff retain SCRUM-448 rules. Empty Redis entries (e.g. trimmed
-pending entries) fail explicitly and remain pending rather than being auto-ACKed.
+pending entries) geram incidente durável e permanecem pendentes sem prova de conclusão, conforme a SCRUM-530 abaixo.
 
-The consumer starts its group at 0-0 and drains **its own pending entries** before
-new entries. Use a stable PERSIST_CONSUMER to resume that identity. It does not
-claim another consumer's pending entries; cross-consumer recovery, controlled
-quarantine replay, retention and complete operational metrics remain SCRUM-530.
+The consumer starts its group at 0-0. SCRUM-530 interleaves bounded batches of
+own pending entries, recovery from abandoned identities and new entries. Keep
+PERSIST_CONSUMER unique among live instances; leases prevent duplicate identities.
 On SIGINT/SIGTERM it stops admitting work and drains the active transaction up to
 PERSIST_SHUTDOWN_TIMEOUT_SECONDS, then cancels and closes resources. Logs report
 IDs, counts, duplicate/conflict quarantine totals and commit latency, without
@@ -323,6 +321,139 @@ measurement values or complete payloads.
 The persistence tests read the versioned schema and migrations from the sibling
 BANCO checkout (override with BANCO_SCHEMA_DIR). This is a **test-only dependency**;
 the installed package/image never imports or reads another repository at runtime.
-CI checks out a pinned BANCO revision with migration 017 and fails if any required
+CI checks out a pinned BANCO revision with migration 018 and fails if any required
 integration is skipped. Use RUN_INTEGRATION=1, TEST_DATABASE_URL and TEST_REDIS_URL
 against disposable services only.
+
+
+## Recuperação e operação — SCRUM-530
+
+A migration **018** deve ser aplicada explicitamente antes de iniciar o consumidor.
+O runtime valida colunas e índices; não executa migrations. Não ativar o novo
+consumidor junto ao `recepcao-persist`, que não participa do protocolo de leases.
+Integração operacional e retirada do legado continuam nas SCRUM-531/532.
+
+### Lease, retomada e falhas técnicas
+
+Cada identidade `(Stream, grupo, consumidor)` recebe uma chave Redis com token
+aleatório (`SET NX PX`). Renovação e liberação usam Lua e conferem o token. Outra
+instância com a mesma identidade é recusada; perda de lease ou falha de renovação
+cancela a transação ativa e encerra o processo. O tempo máximo do processamento é
+30 s; TTL 60 s, renovação 10 s. A configuração exige TTL >= timeout + 2 renovações,
+e o idle mínimo para recuperação >= TTL. Durante SIGTERM/SIGINT a lease continua
+sendo renovada enquanto a transação é drenada dentro do prazo de shutdown.
+
+A recuperação usa `XPENDING` paginado (100 por lote), varre a cada 10 s quando
+chega ao fim e considera idle >= 120000 ms por padrão. Lua revalida owner/idle,
+protege qualquer owner com lease ativa, confere o conteúdo e só então executa
+`XCLAIM`. Identificadores são preservados; o destino transacional da SCRUM-451
+mantém ACK após commit e idempotência. Cursores avançam por item tentado, incluindo
+falhas, para permitir progresso das próximas entradas. Retentativas transitórias
+repetem a transação completa com backoff exponencial e jitter; schema e identidade
+incompatíveis continuam erros explícitos, sem serem convertidos em rejeição.
+Esta implementação usa Redis 7 standalone, sem presumir scripts multikey em Cluster.
+
+Não usamos `XAUTOCLAIM`: no Redis 7 ele pode limpar da PEL referências a entradas
+já removidas. Conteúdo ausente gera `telemetry_recovery_incidents` por origem,
+grupo e ID, com primeiro/último registro e contagem. Se o ledger **da mesma origem**
+provar evento concluído, o incidente é commitado e depois pode ocorrer XACK. Sem
+essa prova, mantém-se a PEL e emite-se erro; não se inventam medições. As demais
+entradas continuam progredindo. Isso detecta perda anterior, sem reconstruí-la.
+Um erro no registro do incidente impede ACK. Nunca remover PEL manualmente para
+ocultar esse caso; investigar backups/origem e registrar decisão operacional.
+
+### Quarentena e replay original
+
+Os comandos abaixo usam somente PostgreSQL, com escopo por `PERSIST_SOURCE_ID` e
+`PERSIST_STREAM`. `status` também lê Redis. Os modos `inspect`, `--resolve` e
+`--validate` continuam sem escrita, grupos ou ACKs.
+
+```bash
+station-persist status
+station-persist quarantine list --limit 100 --after-id 0
+station-persist quarantine show --id 42
+station-persist quarantine replay --id 42 \
+  --request-id 870203e8-52f6-4273-8409-0d71e513a08a \
+  --operator operador-identificavel --reason 'Cadastro corrigido' --dry-run
+# Retire --dry-run para executar; pode repetir o MESMO UUID/operador/motivo
+# após resposta perdida. Uma nova decisão/tentativa após correção usa novo UUID.
+python -m station_persist quarantine replay --id 42 \
+  --request-id 870203e8-52f6-4273-8409-0d71e513a08a \
+  --operator operador-identificavel --reason 'Cadastro corrigido'
+```
+
+O operador é uma identificação obrigatória informada pela CLI, não autenticação.
+Controlar acesso por credenciais PostgreSQL e ambiente autorizado. Listagem paginada
+e detalhes exibem metadados/motivos/histórico, sem despejar medições ou payloads.
+Em show, --limit também limita os históricos de tentativas e resultados, dos mais
+recentes para os antigos.
+UUID válido, operador e justificativa são obrigatórios, inclusive para dry-run.
+Dry-run usa snapshot somente de leitura, sem registrar solicitação ou tentativa;
+avalia destinos sem reservas e pode mudar se o catálogo for alterado antes da execução.
+
+Replay decodifica **os campos string BYTEA originais**, revalida cadastro/limites
+atuais e preserva medição/recepção originais, inclusive origem do timestamp,
+avisos e corte legado usado na primeira execução. A 018 armazena `legacy_max_id`
+nos novos eventos. Para anteriores à 018, timestamp já efetivado no ledger é
+reutilizado; se rejeitados antes disso e sem corte registrado, aplica-se a regra
+estrita (não inferir corte nem reconstruir timestamp perdido).
+
+Solicitação e tentativa RUNNING são duráveis antes da transação de efeitos. Ela
+bloqueia evento/quarentena e cadastros, registra resultados e fecha a quarentena
+somente se não restarem rejeições. Não altera conteúdo, motivos, limites ou
+resultados originais: novos resultados guardam seus próprios limites e origem. Se a estação passar a ser
+associável, sua comunicação usa somente received_at original, com GREATEST; o
+relógio do replay não simula uma nova comunicação.
+Uma chave de evento/campo impede repetir sucesso em replays parciais. Campos já
+aceitos não são reprocessados, mesmo após mudança/remoção do sensor. Valor
+conflitante continua rejeitado, sem substituir leitura ou permitir que exclusão
+da leitura original contorne o conflito. Não há editor de payload nem HTTP novo.
+
+A mesma request-id com os mesmos parâmetros retorna o resultado terminal já
+commitado. Parâmetros divergentes causam erro; requisição simultânea com o mesmo
+UUID retorna BUSY. Novos UUIDs para o mesmo evento são serializados. Estados:
+RUNNING, SUCCEEDED, PARTIAL, REJECTED, TECHNICAL_FAILURE e INTERRUPTED. Falhas técnicas
+fazem rollback de todos os destinos, mas mantêm tentativa auditada. Até 3 tentativas
+transitórias usam backoff/jitter; depois corrigir a falha e repetir o mesmo comando.
+Uma tentativa RUNNING abandonada vira INTERRUPTED na retomada. Se o banco ficar
+inacessível durante a auditoria, RUNNING permanece rastreável até essa retomada.
+Resposta de commit perdida não sobrescreve resultado terminal nem repete efeitos.
+BUSY/PARTIAL/REJECTED são resultados explícitos no JSON; consultar o campo status.
+
+### Métricas, alertas e capacidade
+
+A cada `PERSIST_METRICS_INTERVAL_SECONDS` (30 s), `persist_status` publica JSON com
+lag Redis (null se desconhecido), PEL, idade do menor ID pendente (idade desde o ID
+Redis, não tempo exato de idle), quarentenas abertas/idade, incidentes sem cópia
+durável, tentativas por estado e contagens de destinos commitados. `station-persist
+status` consulta o mesmo snapshot somente de leitura; falhas retornam `degraded`,
+valores desconhecidos null e exit code 1, sem mascarar indisponibilidade como zero.
+
+`event_committed` registra latência, novas leituras, inconsistentes, quarentena e
+duplicatas. `quarantine_replay` separa campos aceitos/rejeitados; aceitos podem ser
+duplicatas e **não** são contador de novas leituras. Nos totais duráveis,
+`reading`/`inconsistent` representam inserções e `duplicate` reaproveitamento.
+`consumption_retry`, `replay_retry`, `pending_recovered`, `missing_stream_content`,
+`consumption_failed` e `lease_release_failed` identificam recuperação e falhas.
+Logs omitem valores/payloads; uma tentativa não conta como nova leitura.
+Não há servidor Prometheus nesta etapa; o ambiente deve coletar os logs.
+
+Procedimento de operação:
+
+1. Consultar `status`. Alertar sobre aumento sustentado de lag/PEL/idade, falhas
+   técnicas, perda de lease, incidentes e quarentena crescente. Limiares e capacidade
+   são decisões do ambiente, não metas presumidas nesta entrega.
+2. Para consumidor encerrado, iniciar instância com identidade única e mesma
+   SOURCE_ID/Stream/grupo, aguardar idle/lease; conferir redução da PEL e commits.
+   Não usar `DELCONSUMER`, XACK manual ou trocar SOURCE_ID como retentativa.
+3. Para rejeição, consultar ID/motivo, corrigir cadastro/regra pelo fluxo existente,
+   executar dry-run e replay com UUID/operador/justificativa; guardar resultado e
+   verificar histórico. Dado imutável inválido pode continuar rejeitado.
+4. Em indisponibilidade longa, preservar Redis (persistência e noeviction), alertar
+   memória/disco e aumentar capacidade ou pausar origem conforme runbook. A recepção
+   controla retenção atômica por idade **e progresso de todos os grupos**; eventos
+   não processados bloqueiam o corte. O tratamento nunca executa XTRIM.
+
+Nenhuma recuperação garante dados já perdidos por XDEL, evicção ou perda de disco.
+A recuperação e replay não mudam o limite MQTT QoS 1/at-least-once nem a limitação
+de precisão float8/JavaScript das APIs atuais. Não há merge ou ativação automática.

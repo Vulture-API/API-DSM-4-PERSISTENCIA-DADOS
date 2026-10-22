@@ -32,6 +32,13 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     legacy_max_id: str | None = None
     source_id: str | None = None
+    recovery_interval_seconds: float = Field(default=10, gt=0)
+    recovery_min_idle_ms: int = Field(default=120000, ge=1)
+    recovery_batch_size: int = Field(default=100, ge=1, le=1000)
+    lease_refresh_seconds: float = Field(default=10, gt=0)
+    lease_ttl_seconds: float = Field(default=60, gt=0)
+    processing_timeout_seconds: float = Field(default=30, gt=0)
+    metrics_interval_seconds: float = Field(default=30, gt=0)
 
     @field_validator("stream", "group", "consumer", "source_id")
     @classmethod
@@ -63,4 +70,13 @@ class Settings(BaseSettings):
             raise ValueError("pool_min_size cannot exceed pool_max_size")
         if self.retry_initial_seconds > self.retry_max_seconds:
             raise ValueError("retry_initial_seconds cannot exceed retry_max_seconds")
+        if (
+            self.lease_ttl_seconds
+            < self.processing_timeout_seconds + 2 * self.lease_refresh_seconds
+        ):
+            raise ValueError(
+                "lease TTL must cover processing timeout and two refreshes"
+            )
+        if self.recovery_min_idle_ms < self.lease_ttl_seconds * 1000:
+            raise ValueError("recovery idle must not be shorter than lease TTL")
         return self
