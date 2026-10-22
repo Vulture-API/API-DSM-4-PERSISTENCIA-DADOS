@@ -161,3 +161,12 @@ async def test_stop_during_unavailable_startup_closes_redis(resources):
     await consumption.run_consumption(settings(), stop)
     pool.acquire.assert_not_called()
     redis.aclose.assert_awaited_once()
+
+
+@pytest.fixture(autouse=True)
+def runtime_unit_support(monkeypatch):
+    # Lease and operational queries have dedicated real Redis/PG integration tests.
+    monkeypatch.setattr(consumption.ConsumerLease, "check", AsyncMock())
+    from station_persist import operations
+
+    monkeypatch.setattr(operations, "report_status", AsyncMock())

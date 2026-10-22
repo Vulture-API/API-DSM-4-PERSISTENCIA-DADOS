@@ -53,6 +53,7 @@ class GroupConsumer:
         self.batch_size, self.block_ms = batch_size, block_ms
         self.processor = processor
         self.stop_event = stop_event
+        self.pending_cursor = "0-0"
 
     async def ensure_group(self) -> None:
         try:
@@ -67,17 +68,31 @@ class GroupConsumer:
         response = await self.redis.xreadgroup(
             self.group,
             self.consumer,
-            {self.stream: "0-0" if pending else ">"},
+            {self.stream: self.pending_cursor if pending else ">"},
             count=self.batch_size,
             block=None if pending else self.block_ms,
         )
+        entries = [
+            StreamEntry.from_redis(entry_id, fields)
+            for _stream, messages in response or []
+            for entry_id, fields in messages
+        ]
+        if pending and not entries:
+            self.pending_cursor = "0-0"
+        return await self.process_entries(entries, pending=pending)
+
+    async def process_entries(self, entries, *, pending=False):
         confirmed = 0
-        for _stream, messages in response or []:
-            for entry_id, fields in messages:
-                if self.stop_event is not None and self.stop_event.is_set():
-                    return confirmed
-                outcome = await self.processor(StreamEntry.from_redis(entry_id, fields))
-                if outcome is ProcessingResult.COMPLETED:
-                    await self.redis.xack(self.stream, self.group, entry_id)
-                    confirmed += 1
+        for entry in entries:
+            if self.stop_event is not None and self.stop_event.is_set():
+                break
+            if pending:
+                # Advance only to the attempted entry. A failing first item must
+                # not starve the rest of its batch on every scan.
+                self.pending_cursor = entry.entry_id
+            outcome = await self.processor(entry)
+            if outcome is ProcessingResult.COMPLETED:
+                confirmed += int(
+                    await self.redis.xack(self.stream, self.group, entry.entry_id)
+                )
         return confirmed

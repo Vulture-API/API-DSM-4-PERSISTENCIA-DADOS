@@ -1,9 +1,10 @@
-"""Opt-in writes. Cross-consumer recovery and quarantine replay are SCRUM-530."""
+"""Opt-in writes with leased identities and bounded pending recovery."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import random
 
 import asyncpg
 from redis.asyncio import Redis
@@ -13,6 +14,7 @@ from redis.exceptions import TimeoutError as RedisTimeoutError
 from station_persist.config import Settings
 from station_persist.logging_config import log_event
 from station_persist.persistence import process_entry, validate_storage_schema
+from station_persist.recovery import ConsumerLease, PendingRecovery, missing_content
 from station_persist.service import install_signal_handlers
 from station_persist.stream import GroupConsumer
 
@@ -40,15 +42,22 @@ async def _pause(stop: asyncio.Event, delay: float) -> None:
 
 
 async def consume_loop(
-    worker: GroupConsumer, settings: Settings, stop: asyncio.Event
+    worker: GroupConsumer,
+    settings: Settings,
+    stop: asyncio.Event,
+    recovery=None,
+    lease=None,
 ) -> None:
     delay = settings.retry_initial_seconds
     while not stop.is_set():
         try:
-            # Drain own pending entries before new messages. No XCLAIM/XAUTOCLAIM;
-            # abandoned consumer identities remain for SCRUM-530.
-            while not stop.is_set() and await worker.process_once(pending=True):
-                pass
+            # One bounded own/recovery/new batch per cycle; cursors progress past
+            # failed entries so technical failures cannot starve later work.
+            if lease is not None:
+                await lease.check()
+            await worker.process_once(pending=True)
+            if recovery is not None and not stop.is_set():
+                await recovery.once()
             if not stop.is_set():
                 await worker.process_once()
             delay = settings.retry_initial_seconds
@@ -59,7 +68,7 @@ async def consume_loop(
                 error_type=type(exc).__name__,
                 retry_in_seconds=delay,
             )
-            await _pause(stop, delay)
+            await _pause(stop, random.uniform(delay / 2, delay))
             delay = min(delay * 2, settings.retry_max_seconds)
 
 
@@ -77,7 +86,10 @@ async def run_consumption(
         socket_timeout=settings.socket_timeout_seconds + settings.block_ms / 1000,
         socket_connect_timeout=settings.socket_timeout_seconds,
     )
-    pool = worker_task = stopper = None
+    pool = worker_task = stopper = heartbeat = metrics_task = None
+    lease = ConsumerLease(redis, settings)
+    lease_stop = asyncio.Event()
+    lease_acquired = False
     try:
         delay = settings.retry_initial_seconds
         while not stop.is_set():
@@ -98,19 +110,26 @@ async def run_consumption(
                     error_type=type(exc).__name__,
                     retry_in_seconds=delay,
                 )
-                await _pause(stop, delay)
+                await _pause(stop, random.uniform(delay / 2, delay))
                 delay = min(delay * 2, settings.retry_max_seconds)
         if pool is None:
             return
 
         async def process(entry):
-            return await process_entry(
-                entry,
-                pool,
-                source_id=settings.source_id,
-                stream=settings.stream,
-                legacy_max_id=settings.legacy_max_id,
-            )
+            if not entry.fields:
+                # The helper ACKs only after durable completion proof and incident.
+                await missing_content(pool, redis, settings, entry.entry_id)
+                from station_persist.stream import ProcessingResult
+
+                return ProcessingResult.INCOMPLETE
+            async with asyncio.timeout(settings.processing_timeout_seconds):
+                return await process_entry(
+                    entry,
+                    pool,
+                    source_id=settings.source_id,
+                    stream=settings.stream,
+                    legacy_max_id=settings.legacy_max_id,
+                )
 
         worker = GroupConsumer(
             redis,
@@ -137,19 +156,32 @@ async def run_consumption(
                     error_type=type(exc).__name__,
                     retry_in_seconds=delay,
                 )
-                await _pause(stop, delay)
+                await _pause(stop, random.uniform(delay / 2, delay))
                 delay = min(delay * 2, settings.retry_max_seconds)
         if stop.is_set():
             return
         log_event(
             logger, "consumption_started", stream=settings.stream, writes_enabled=True
         )
-        worker_task = asyncio.create_task(consume_loop(worker, settings, stop))
+        await lease.acquire()
+        lease_acquired = True
+        heartbeat = asyncio.create_task(lease.heartbeat(lease_stop))
+        recovery = PendingRecovery(redis, pool, worker, settings, lease)
+        from station_persist.operations import report_status
+
+        metrics_task = asyncio.create_task(
+            report_status(settings, pool, redis, lease_stop)
+        )
+        worker_task = asyncio.create_task(
+            consume_loop(worker, settings, stop, recovery, lease)
+        )
         stopper = asyncio.create_task(stop.wait())
         done, _ = await asyncio.wait(
-            [worker_task, stopper], return_when=asyncio.FIRST_COMPLETED
+            [worker_task, stopper, heartbeat], return_when=asyncio.FIRST_COMPLETED
         )
-        if worker_task in done:
+        if heartbeat in done:
+            heartbeat.result()
+        elif worker_task in done:
             worker_task.result()
         else:
             try:
@@ -162,11 +194,16 @@ async def run_consumption(
         log_event(logger, "consumption_failed", error_type=type(exc).__name__)
         raise
     finally:
-        for task in (worker_task, stopper):
+        lease_stop.set()
+        for task in (worker_task, stopper, heartbeat, metrics_task):
             if task is not None:
                 task.cancel()
         await asyncio.gather(
-            *(t for t in (worker_task, stopper) if t is not None),
+            *(
+                t
+                for t in (worker_task, stopper, heartbeat, metrics_task)
+                if t is not None
+            ),
             return_exceptions=True,
         )
         try:
@@ -178,6 +215,11 @@ async def run_consumption(
                 except TimeoutError:
                     pool.terminate()
         finally:
+            if lease_acquired:
+                try:
+                    await lease.release()
+                except Exception:
+                    log_event(logger, "lease_release_failed")
             await redis.aclose()
             for sig in installed:
                 asyncio.get_running_loop().remove_signal_handler(sig)
