@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import os
 import socket
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from station_persist.validation import stream_id_parts
+
+# Opções aceitas pela libpq que o asyncpg repassaria como parâmetro de sessão,
+# derrubando a conexão (ex.: a URL do Neon traz channel_binding=require).
+LIBPQ_ONLY_OPTIONS = frozenset({"channel_binding"})
 
 
 class Settings(BaseSettings):
@@ -39,6 +44,21 @@ class Settings(BaseSettings):
     lease_ttl_seconds: float = Field(default=60, gt=0)
     processing_timeout_seconds: float = Field(default=30, gt=0)
     metrics_interval_seconds: float = Field(default=30, gt=0)
+
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def drop_libpq_only_options(cls, value: object) -> object:
+        raw = value.get_secret_value() if isinstance(value, SecretStr) else value
+        if not isinstance(raw, str):
+            return value
+        parts = urlsplit(raw)
+        if not parts.query:
+            return raw
+        query = parse_qsl(parts.query, keep_blank_values=True)
+        kept = [(key, item) for key, item in query if key not in LIBPQ_ONLY_OPTIONS]
+        if len(kept) == len(query):
+            return raw
+        return urlunsplit(parts._replace(query=urlencode(kept)))
 
     @field_validator("stream", "group", "consumer", "source_id")
     @classmethod
