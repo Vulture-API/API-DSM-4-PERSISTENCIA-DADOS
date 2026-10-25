@@ -1,0 +1,91 @@
+name: CI
+on:
+  push:
+    branches: [dev, main, 'SCRUM-*', 'feature/SCRUM-*']
+  pull_request:
+    branches: [dev, main, 'feature/SCRUM-*']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    name: Lint, testes e build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 30
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: telemetry_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 30
+    env:
+      RUN_INTEGRATION: '1'
+      TEST_REDIS_URL: redis://127.0.0.1:6379/15
+      TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/telemetry_test
+      BANCO_SCHEMA_DIR: ${{ github.workspace }}/contracts/banco
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout versioned BANCO contract (SCRUM-530)
+        uses: actions/checkout@v4
+        with:
+          repository: Vulture-API/API-DSM-4-BANCO
+          ref: 122afee72bee9201dcd58e9349aa2423dd3951a4
+          path: contracts/banco
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: python -m pip install -e '.[test,lint]' build
+      - name: Lint and formatting
+        run: |
+          ruff check .
+          ruff format --check .
+      - name: Tests and coverage
+        run: pytest --cov --cov-report=term-missing --cov-report=xml --junitxml=reports/junit.xml
+      - name: Require integration execution without skips
+        run: |
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+          root = ET.parse('reports/junit.xml').getroot()
+          cases = list(root.iter('testcase'))
+          assert cases and not list(root.iter('skipped')), 'Required tests were skipped'
+          assert sum('test_real_' in case.attrib['name'] for case in cases) >= 2
+          PY
+      - name: Package
+        run: python -m build
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: verification
+          path: |
+            coverage.xml
+            reports/
+            dist/
+
+  docker:
+    name: Validar build da imagem Docker
+    runs-on: ubuntu-latest
+    needs: verify
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Docker build and non-root check
+        run: |
+          docker build -t station-persist:ci .
+          test "$(docker run --rm --entrypoint id station-persist:ci -u)" != 0
+          docker run --rm station-persist:ci --help
