@@ -20,7 +20,7 @@ jobs:
   procedencia:
     name: Procedência do commit na dev
     if: github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
@@ -31,7 +31,7 @@ jobs:
     steps:
       - name: Conferir se o conteúdo já foi testado no PR
         id: conferir
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const sha = context.sha;
@@ -85,7 +85,7 @@ jobs:
     # provar que este conteúdo já passou no PR.
     if: ${{ !cancelled() && needs.procedencia.outputs.testado != 'true' }}
     name: Lint, testes e build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     services:
       redis:
@@ -113,15 +113,15 @@ jobs:
       TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/telemetry_test
       BANCO_SCHEMA_DIR: ${{ github.workspace }}/contracts/banco
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Checkout versioned BANCO contract (SCRUM-530)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: Vulture-API/API-DSM-4-BANCO
           ref: 122afee72bee9201dcd58e9349aa2423dd3951a4
           path: contracts/banco
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       - name: Install
@@ -143,7 +143,7 @@ jobs:
           PY
       - name: Package
         run: python -m build
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         if: always()
         with:
           name: verification
@@ -154,12 +154,12 @@ jobs:
 
   docker:
     name: Validar build da imagem Docker
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: verify
     if: ${{ !cancelled() && needs.verify.result == 'success' }}
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Docker build and non-root check
         run: |
           docker build -t station-persist:ci .
