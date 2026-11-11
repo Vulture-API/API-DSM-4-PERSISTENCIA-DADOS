@@ -6,9 +6,15 @@ import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, DecimalException
 from enum import StrEnum
 
+from station_persist.calibration import (
+    Calibration,
+    InvalidCalibrationError,
+    apply_calibration,
+    effective_calibration,
+)
 from station_persist.relationships import (
     CatalogConnection,
     EventResolution,
@@ -67,6 +73,8 @@ class MeasurementValidation:
     min_value: Decimal | None = None
     max_value: Decimal | None = None
     reasons: tuple[str, ...] = ()
+    # Reading as sent by the station, before the sensor calibration (SCRUM-601).
+    raw_value: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +120,16 @@ def exact_numeric(value: object) -> tuple[Decimal | None, str | None]:
     if max(0, len(digits) + exponent) > 131072 or max(0, -exponent) > 16383:
         return None, "numeric_not_representable"
     return Decimal((sign, tuple(digits), exponent)), None
+
+
+def _calibrated(
+    raw: Decimal, calibration: Calibration
+) -> tuple[Decimal | None, str | None]:
+    """Limits and storage use the converted value; the result must still fit."""
+    try:
+        return exact_numeric(apply_calibration(raw, calibration))
+    except DecimalException:
+        return None, "numeric_not_representable"
 
 
 def _timestamp(
@@ -190,19 +208,32 @@ async def validate_entries(
             "SELECT c.relname, a.attname, a.atttypid = 'numeric'::regtype AND a.atttypmod = -1 AS exact "
             "FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
             "WHERE (a.attrelid = to_regclass('readings') AND a.attname = 'value' "
-            "OR a.attrelid = to_regclass('sensors') AND a.attname IN ('min_value','max_value')) "
+            "OR a.attrelid = to_regclass('sensors') "
+            "AND a.attname IN ('min_value','max_value','gain','offset_value') "
+            "OR a.attrelid = to_regclass('sensor_types') "
+            "AND a.attname IN ('factor','gain','offset_value')) "
             "AND NOT a.attisdropped"
         )
         if {(row["relname"], row["attname"]) for row in schema} != {
             ("readings", "value"),
             ("sensors", "min_value"),
             ("sensors", "max_value"),
+            ("sensors", "gain"),
+            ("sensors", "offset_value"),
+            ("sensor_types", "factor"),
+            ("sensor_types", "gain"),
+            ("sensor_types", "offset_value"),
         } or not all(row["exact"] for row in schema):
             raise CatalogConfigurationError(
-                "Apply BANCO migration 016: unconstrained NUMERIC required"
+                "Apply BANCO migration 016 and migration 021: "
+                "unconstrained NUMERIC required"
             )
         rows = await connection.fetch(
-            "SELECT id, station_id, min_value, max_value FROM sensors WHERE id = ANY($1::integer[])",
+            "SELECT s.id, s.station_id, s.min_value, s.max_value, "
+            "s.gain, s.offset_value, t.factor AS type_factor, "
+            "t.gain AS type_gain, t.offset_value AS type_offset "
+            "FROM sensors s JOIN sensor_types t ON t.id = s.sensor_type_id "
+            "WHERE s.id = ANY($1::integer[])",
             ids,
         )
         for row in rows:
@@ -221,7 +252,19 @@ async def validate_entries(
             minimum, maximum = limits
             if minimum is not None and maximum is not None and minimum > maximum:
                 raise CatalogConfigurationError("Sensor minimum exceeds maximum")
-            catalog[row["id"]] = (row["station_id"], minimum, maximum)
+            try:
+                calibration = effective_calibration(
+                    type_factor=row["type_factor"],
+                    type_gain=row["type_gain"],
+                    type_offset=row["type_offset"],
+                    sensor_gain=row["gain"],
+                    sensor_offset=row["offset_value"],
+                )
+            except InvalidCalibrationError as error:
+                raise CatalogConfigurationError(
+                    f"Invalid sensor calibration: {error}"
+                ) from error
+            catalog[row["id"]] = (row["station_id"], minimum, maximum, calibration)
         if set(ids) != catalog.keys():
             raise CatalogChangedError(
                 "Sensor disappeared after relationship resolution"
@@ -237,15 +280,19 @@ async def validate_entries(
         fields = []
         for field in event.fields:
             minimum = maximum = None
+            calibration = Calibration()
             if field.associated:
-                station_id, minimum, maximum = catalog[field.sensor_id]
+                station_id, minimum, maximum, calibration = catalog[field.sensor_id]
                 if station_id != field.station_id:
                     raise CatalogChangedError("Sensor station changed after resolution")
             reasons = field.reasons + time.reasons
-            number = None
+            number = raw = None
             status = ValidationStatus.REJECTED
             if not reasons:
                 number, reason = exact_numeric(field.value)
+                raw = number
+                if reason is None and not calibration.identity:
+                    number, reason = _calibrated(number, calibration)
                 if reason is not None:
                     reasons = (reason,)
                 else:
@@ -257,7 +304,9 @@ async def validate_entries(
                     if reasons:
                         status = ValidationStatus.OUT_OF_RANGE
             fields.append(
-                MeasurementValidation(field, status, number, minimum, maximum, reasons)
+                MeasurementValidation(
+                    field, status, number, minimum, maximum, reasons, raw
+                )
             )
         events.append(EventValidation(event, time, tuple(fields)))
     return tuple(events)

@@ -50,6 +50,7 @@ async def storage():
             "migrations/016_sensor_limits_and_reading_precision.sql",
             "migrations/017_telemetry_destinations_and_idempotency.sql",
             "migrations/018_telemetry_recovery_and_replay.sql",
+            "migrations/021_sensor_calibration.sql",
         ):
             await conn.execute((root / file).read_text())
         await conn.execute("""

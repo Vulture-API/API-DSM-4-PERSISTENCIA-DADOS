@@ -186,6 +186,34 @@ ficam disponíveis para as SCRUM-449/451; rejeições alimentam as SCRUM-449/530
   limites invertidos/não finitos são erros de configuração, nunca limites ausentes.
   Catálogo alterado entre consultas sem snapshot gera erro técnico recuperável.
 
+### Calibração dos sensores (SCRUM-601)
+
+A estação envia a leitura bruta e o tratamento converte para a unidade do tipo
+antes de validar os limites e gravar:
+
+```
+valor = bruto × fator × ganho + offset
+```
+
+- `sensor_types.factor` é a conversão padrão do tipo. `gain` e `offset_value` são
+  a calibração: os de `sensors` valem no lugar dos de `sensor_types`. Campo NULL
+  não altera a leitura, então sensor sem calibração é gravado como recebido.
+- A conta é exata (`calibration.py`), sem ponto flutuante nem arredondamento do
+  contexto Decimal. Resultado que não cabe em NUMERIC é rejeitado com
+  `numeric_not_representable`.
+- `min_value`/`max_value`, `readings.value` e `occurrences.value` usam o valor
+  convertido. O valor bruto não é gravado em `readings`; continua no payload
+  original de `telemetry_events.original_fields`.
+- Leituras já gravadas não são recalculadas quando a calibração muda. Uma
+  medição reenviada (mesmo sensor e instante) depois da mudança não substitui a
+  leitura gravada nem cria outra: vai para a quarentena com
+  `conflicting_measurement`. Com a mesma calibração continua sendo duplicata.
+- Fator ou ganho zero, ou valor não finito no catálogo, é erro de configuração.
+- O schema deve conter `sensors.gain/offset_value` e
+  `sensor_types.factor/gain/offset_value` como NUMERIC sem escala fixa: **aplicar
+  a migration 021 do BANCO antes de implantar esta versão**. Sem ela o consumo
+  não inicia e o erro indica a migration.
+
 ### Timestamps e corte legado
 
 A fonte de `unix_time` é o payload, não o campo extraído do Stream. Exige token
@@ -321,7 +349,7 @@ measurement values or complete payloads.
 The persistence tests read the versioned schema and migrations from the sibling
 BANCO checkout (override with BANCO_SCHEMA_DIR). This is a **test-only dependency**;
 the installed package/image never imports or reads another repository at runtime.
-CI checks out a pinned BANCO revision with migration 018 and fails if any required
+CI checks out a pinned BANCO revision with migration 021 and fails if any required
 integration is skipped. Use RUN_INTEGRATION=1, TEST_DATABASE_URL and TEST_REDIS_URL
 against disposable services only.
 

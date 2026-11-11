@@ -39,13 +39,17 @@ async def catalog():
                 property_id integer NOT NULL REFERENCES properties,
                 mac_address varchar(50) NOT NULL UNIQUE
             );
-            CREATE TABLE sensor_types(id integer PRIMARY KEY);
+            CREATE TABLE sensor_types(
+                id integer PRIMARY KEY,
+                factor numeric NULL, gain numeric NULL, offset_value numeric NULL
+            );
             CREATE TABLE sensors(
                 id integer PRIMARY KEY,
                 station_id integer NOT NULL REFERENCES stations,
                 sensor_type_id integer NOT NULL REFERENCES sensor_types,
                 local_identifier varchar(50) NOT NULL,
                 min_value numeric NULL, max_value numeric NULL,
+                gain numeric NULL, offset_value numeric NULL,
                 UNIQUE(station_id, local_identifier)
             );
             CREATE TABLE readings(

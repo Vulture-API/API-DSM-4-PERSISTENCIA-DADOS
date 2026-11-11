@@ -78,7 +78,16 @@ async def validate_storage_schema(conn: Any) -> None:
             "detected_at",
         },
         "stations": {"id", "property_id", "last_communication_at"},
-        "sensors": {"id", "station_id", "sensor_type_id", "min_value", "max_value"},
+        "sensors": {
+            "id",
+            "station_id",
+            "sensor_type_id",
+            "min_value",
+            "max_value",
+            "gain",
+            "offset_value",
+        },
+        "sensor_types": {"id", "factor", "gain", "offset_value"},
     }
     required["telemetry_events"].add("legacy_max_id")
     required["telemetry_replay_requests"] = {
@@ -182,6 +191,11 @@ async def validate_storage_schema(conn: Any) -> None:
             ("readings", "value"),
             ("sensors", "min_value"),
             ("sensors", "max_value"),
+            ("sensors", "gain"),
+            ("sensors", "offset_value"),
+            ("sensor_types", "factor"),
+            ("sensor_types", "gain"),
+            ("sensor_types", "offset_value"),
             ("occurrences", "value"),
         }
         <= exact
@@ -201,7 +215,7 @@ async def validate_storage_schema(conn: Any) -> None:
         or not replay_index
     ):
         raise CatalogConfigurationError(
-            "Apply BANCO migrations 016 (both), 017 and 018 before consume"
+            "Apply BANCO migrations 016 (both), 017, 018 and 021 before consume"
         )
 
 
@@ -230,7 +244,8 @@ async def lock_catalog(conn: Any, event: Any) -> None:
     if station_id is not None:
         # Lock station before sensors. The stronger station lock also avoids
         # lock-upgrade deadlocks when updating communication. Sensor FOR SHARE
-        # protects non-key limits; changed rows abort the whole RR snapshot.
+        # protects non-key limits and calibration, as does the type lock below;
+        # changed rows abort the whole RR snapshot.
         await conn.fetch(
             "SELECT id FROM stations WHERE id=$1 FOR NO KEY UPDATE", station_id
         )
@@ -241,6 +256,16 @@ async def lock_catalog(conn: Any, event: Any) -> None:
         await conn.fetch(
             "SELECT id FROM sensors WHERE id=ANY($1::integer[]) ORDER BY id FOR SHARE",
             sensor_ids,
+        )
+        await conn.fetch(
+            "SELECT id FROM sensor_types WHERE id=ANY($1::integer[]) ORDER BY id FOR SHARE",
+            sorted(
+                {
+                    f.resolution.sensor_type_id
+                    for f in event.fields
+                    if f.resolution.associated
+                }
+            ),
         )
 
 

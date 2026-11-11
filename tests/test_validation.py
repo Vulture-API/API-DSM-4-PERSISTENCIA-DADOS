@@ -33,7 +33,33 @@ def entry(
     return StreamEntry.from_redis(entry_id, fields)
 
 
-def db(keys=("temp",), minimum=None, maximum=None):
+SCHEMA = (
+    ("readings", "value"),
+    ("sensors", "min_value"),
+    ("sensors", "max_value"),
+    ("sensors", "gain"),
+    ("sensors", "offset_value"),
+    ("sensor_types", "factor"),
+    ("sensor_types", "gain"),
+    ("sensor_types", "offset_value"),
+)
+
+
+def sensor_row(sensor_id=10, station_id=1, minimum=None, maximum=None, **calibration):
+    return dict(
+        id=sensor_id,
+        station_id=station_id,
+        min_value=minimum,
+        max_value=maximum,
+        gain=calibration.get("gain"),
+        offset_value=calibration.get("offset"),
+        type_factor=calibration.get("type_factor"),
+        type_gain=calibration.get("type_gain"),
+        type_offset=calibration.get("type_offset"),
+    )
+
+
+def db(keys=("temp",), minimum=None, maximum=None, **calibration):
     conn = AsyncMock()
     conn.fetch.side_effect = [
         [dict(id=1, property_id=2, mac_address="AA:BB:CC:DD:EE:01")],
@@ -47,16 +73,9 @@ def db(keys=("temp",), minimum=None, maximum=None):
             )
             for i, k in enumerate(keys)
         ],
+        [dict(relname=table, attname=column, exact=True) for table, column in SCHEMA],
         [
-            dict(relname=table, attname=column, exact=True)
-            for table, column in (
-                ("readings", "value"),
-                ("sensors", "min_value"),
-                ("sensors", "max_value"),
-            )
-        ],
-        [
-            dict(id=i + 10, station_id=1, min_value=minimum, max_value=maximum)
+            sensor_row(i + 10, minimum=minimum, maximum=maximum, **calibration)
             for i, _ in enumerate(keys)
         ],
     ]
@@ -268,8 +287,8 @@ async def test_invalid_catalog_is_technical(limits):
     "rows",
     [
         [],
-        [dict(id=10, station_id=2, min_value=None, max_value=None)],
-        [dict(id=10, station_id=1, min_value=None, max_value=None)] * 2,
+        [sensor_row(station_id=2)],
+        [sensor_row()] * 2,
     ],
 )
 async def test_catalog_changed_or_duplicated_remains_technical(rows):
