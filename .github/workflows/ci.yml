@@ -118,7 +118,7 @@ jobs:
         uses: actions/checkout@v5
         with:
           repository: Vulture-API/API-DSM-4-BANCO
-          ref: 122afee72bee9201dcd58e9349aa2423dd3951a4
+          ref: a70d6cbd0671b7e194d245f74499456b24b401c1
           path: contracts/banco
           persist-credentials: false
       - uses: actions/setup-python@v6
