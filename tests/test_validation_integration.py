@@ -42,7 +42,7 @@ async def test_real_validation_exact_values_limits_partial_results(catalog):
         Status.OUT_OF_RANGE,
         Status.REJECTED,
         Status.VALID,
-        Status.REJECTED,
+        Status.IGNORED,
     ]
     assert result.fields[0].reasons == ("above_max",)
     assert result.fields[1].resolution.value is True

@@ -184,11 +184,12 @@ async def test_partial_results_and_original_values():
     assert [f.status for f in result.fields] == [
         Status.VALID,
         Status.REJECTED,
-        Status.REJECTED,
+        Status.IGNORED,
     ]
     assert result.fields[1].resolution.value is True
     assert result.fields[2].resolution.value == "PRIVATE"
     assert result.fields[2].reasons == ("unknown_sensor",)
+    assert result.fields[2].value is None
     assert result.timestamp.source == TimestampSource.PAYLOAD
     assert result.timestamp.unix_time == 1760000000
     assert result.resolution.source.fields == original.fields

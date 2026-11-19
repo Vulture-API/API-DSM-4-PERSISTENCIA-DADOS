@@ -13,6 +13,7 @@ class Destination(StrEnum):
     READING = "reading"
     INCONSISTENT = "inconsistent"
     QUARANTINE = "quarantine"
+    IGNORED = "ignored"
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +42,7 @@ def build_processing_plan(event: EventValidation) -> ProcessingPlan:
         Status.VALID: Destination.READING,
         Status.OUT_OF_RANGE: Destination.INCONSISTENT,
         Status.REJECTED: Destination.QUARANTINE,
+        Status.IGNORED: Destination.IGNORED,
     }
     return ProcessingPlan(
         event,

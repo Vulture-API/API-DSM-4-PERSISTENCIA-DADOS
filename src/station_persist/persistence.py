@@ -182,6 +182,14 @@ async def validate_storage_schema(conn: Any) -> None:
         and "<>" in row["predicate"]
         for row in indexes
     )
+    # SCRUM-623: both destination checks must accept channels with no sensor.
+    ignored_destination = (
+        await conn.fetchval(
+            "SELECT count(*) FROM pg_constraint WHERE conrelid=to_regclass('telemetry_results') "
+            "AND contype='c' AND pg_get_constraintdef(oid) LIKE '%''ignored''%'"
+        )
+        >= 2
+    )
     if (
         any(
             not columns <= found.get(table, set())
@@ -213,9 +221,10 @@ async def validate_storage_schema(conn: Any) -> None:
         <= unique
         or not occurrence_index
         or not replay_index
+        or not ignored_destination
     ):
         raise CatalogConfigurationError(
-            "Apply BANCO migrations 016 (both), 017, 018 and 021 before consume"
+            "Apply BANCO migrations 016 (both), 017, 018, 021 and 023 before consume"
         )
 
 
@@ -339,7 +348,7 @@ async def _persist(
         entry.entry_id,
         raw,
     )
-    counts = dict(readings=0, inconsistent=0, quarantine=0, duplicates=0)
+    counts = dict(readings=0, inconsistent=0, quarantine=0, duplicates=0, ignored=0)
     if event_id is None:
         existing = await conn.fetchrow(
             "SELECT original_fields,completed_at FROM telemetry_events "
@@ -365,6 +374,16 @@ async def _persist(
         if field.destination == Destination.QUARANTINE:
             await _quarantine(conn, event_id, field, field.reasons)
             counts["quarantine"] += 1
+            continue
+        if field.destination == Destination.IGNORED:
+            await conn.execute(
+                "INSERT INTO telemetry_results(event_id,ordinal,destination,reasons) "
+                "VALUES($1,$2,'ignored',$3)",
+                event_id,
+                field.ordinal,
+                list(field.reasons),
+            )
+            counts["ignored"] += 1
             continue
         measurement = field.measurement
         sensor_id = measurement.resolution.sensor_id
