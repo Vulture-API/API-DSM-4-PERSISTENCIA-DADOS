@@ -51,6 +51,7 @@ async def storage():
             "migrations/017_telemetry_destinations_and_idempotency.sql",
             "migrations/018_telemetry_recovery_and_replay.sql",
             "migrations/021_sensor_calibration.sql",
+            "migrations/023_telemetry_ignored_fields.sql",
         ):
             await conn.execute((root / file).read_text())
         await conn.execute("""
@@ -125,7 +126,7 @@ async def test_real_mixed_destinations_exact_and_private_logs(storage, caplog):
     await validate_storage_schema(conn)
     with caplog.at_level(logging.INFO, logger="station_persist"):
         assert await persist(pool, source) is ProcessingResult.COMPLETED
-    assert await counts(conn) == (2, 1, 1, 1, 3)
+    assert await counts(conn) == (2, 1, 1, 0, 3)
     readings = await conn.fetch(
         "SELECT sensor_id,value,data_consistent FROM readings ORDER BY sensor_id"
     )
@@ -138,9 +139,9 @@ async def test_real_mixed_destinations_exact_and_private_logs(storage, caplog):
         and readings[1]["data_consistent"] is True
     )
     assert await conn.fetchval("SELECT value FROM occurrences") == readings[0]["value"]
-    assert await conn.fetchval("SELECT reasons FROM telemetry_quarantine") == [
-        "unknown_sensor"
-    ]
+    assert await conn.fetchrow(
+        "SELECT ordinal,destination,sensor_id,reading_id,reasons FROM telemetry_results WHERE destination='ignored'"
+    ) == (3, "ignored", None, None, ["unknown_sensor"])
     assert json.loads(
         await conn.fetchval("SELECT original_fields FROM telemetry_events")
     ) == dict(source.fields)
@@ -156,6 +157,86 @@ async def test_real_mixed_destinations_exact_and_private_logs(storage, caplog):
     assert (
         "PAYLOAD_SECRET" not in caplog.text and "50.000000000000001" not in caplog.text
     )
+
+
+@pytest.mark.asyncio
+async def test_real_board_channels_without_sensor_are_ignored(storage, caplog):
+    conn, pool, _ = storage
+    source = entry(
+        '{"unix_time":1760000000,"temp":21.5,"humidity":60,"an32":1873,"an39":0,'
+        '"pu26":3,"di18":1}'
+    )
+    with caplog.at_level(logging.INFO, logger="station_persist"):
+        assert await persist(pool, source) is ProcessingResult.COMPLETED
+    assert await counts(conn) == (2, 0, 1, 0, 6)
+    ignored = await conn.fetch(
+        "SELECT ordinal,sensor_id,reading_id,quarantine_id,reasons FROM telemetry_results "
+        "WHERE destination='ignored' ORDER BY ordinal"
+    )
+    assert [r["ordinal"] for r in ignored] == [3, 4, 5, 6]
+    assert all(
+        r["sensor_id"] is None
+        and r["reading_id"] is None
+        and r["quarantine_id"] is None
+        and r["reasons"] == ["unknown_sensor"]
+        for r in ignored
+    )
+    assert json.loads(
+        await conn.fetchval("SELECT original_fields FROM telemetry_events")
+    ) == dict(source.fields)
+    assert any(
+        r.msg == "event_committed" and r.structured_fields["ignored"] == 4
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_real_channel_registered_later_is_stored_from_then_on(storage):
+    conn, pool, _ = storage
+    await persist(pool, entry('{"unix_time":1760000000,"pu26":3}'))
+    await conn.execute(
+        "INSERT INTO sensor_types(id,name,unit_of_measure) VALUES(2,'rain','mm'); "
+        "INSERT INTO sensors(id,station_id,sensor_type_id,local_identifier,gain) VALUES(10,1,2,'pu26',0.2)"
+    )
+    await persist(pool, entry('{"unix_time":1760000060,"pu26":3}', entry_id="2-0"))
+    assert await conn.fetchval("SELECT count(*) FROM telemetry_quarantine") == 0
+    assert await conn.fetch(
+        "SELECT sensor_id,value FROM readings ORDER BY unix_time"
+    ) == [(10, Decimal("0.6"))]
+    assert [
+        r["destination"]
+        for r in await conn.fetch(
+            "SELECT destination FROM telemetry_results ORDER BY event_id"
+        )
+    ] == ["ignored", "reading"]
+
+
+@pytest.mark.asyncio
+async def test_real_unknown_station_is_still_quarantined(storage):
+    conn, pool, _ = storage
+    await persist(pool, entry('{"pu26":3}', estacao_id="99"))
+    assert await conn.fetchval("SELECT reasons FROM telemetry_quarantine") == [
+        "unknown_station"
+    ]
+    assert (
+        await conn.fetchval(
+            "SELECT count(*) FROM telemetry_results WHERE destination='ignored'"
+        )
+        == 0
+    )
+
+
+@pytest.mark.asyncio
+async def test_real_schema_guard_requires_ignored_destination(storage):
+    conn, _, _ = storage
+    await validate_storage_schema(conn)
+    await conn.execute(
+        "ALTER TABLE telemetry_results DROP CONSTRAINT telemetry_results_destination_check; "
+        "ALTER TABLE telemetry_results ADD CONSTRAINT telemetry_results_destination_check "
+        "CHECK (destination IN ('reading','inconsistent','duplicate','quarantine'))"
+    )
+    with pytest.raises(CatalogConfigurationError, match="023"):
+        await validate_storage_schema(conn)
 
 
 @pytest.mark.asyncio

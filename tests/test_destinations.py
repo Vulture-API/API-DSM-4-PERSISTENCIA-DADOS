@@ -29,6 +29,21 @@ async def test_mixed_plan_preserves_original_and_exact_values():
 
 
 @pytest.mark.asyncio
+async def test_channel_without_sensor_is_ignored_not_quarantined():
+    source = entry('{"temp":1,"an32":1873,"pu26":3,"humidity":true}')
+    (validation,) = await validate_entries([source], db(("temp", "humidity")))
+    plan = build_processing_plan(validation)
+    assert [f.destination for f in plan.fields] == [
+        Destination.READING,
+        Destination.IGNORED,
+        Destination.IGNORED,
+        Destination.QUARANTINE,
+    ]
+    assert plan.fields[1].reasons == ("unknown_sensor",)
+    assert plan.fields[3].reasons == ("invalid_numeric_type",)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("payload", ["{", "[]", '{"unix_time":null,"temp":1}'])
 async def test_whole_event_rejection_has_durable_destination(payload):
     (validation,) = await validate_entries([entry(payload)], db())
