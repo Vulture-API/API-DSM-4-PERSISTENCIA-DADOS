@@ -257,11 +257,19 @@ a persistência definitiva em produção (SCRUM-451/531).
 ## Destinos das medições — SCRUM-449
 
 `build_processing_plan(EventValidation)` é uma função sem escrita. Conserva a
-validação/origem e classifica cada campo como `reading`, `inconsistent` ou
-`quarantine`. A posição do campo identifica o resultado; a posição zero representa
+validação/origem e classifica cada campo como `reading`, `inconsistent`,
+`quarantine` ou `ignored`. A posição do campo identifica o resultado; a posição zero representa
 uma rejeição do evento inteiro, inclusive payload sem campos associáveis.
 Uma rejeição individual não impede o destino dos outros campos. O plano não é
 `ProcessingResult.COMPLETED` e nunca autoriza ACK.
+
+`ignored` (SCRUM-624): o datalogger envia todos os canais da placa, inclusive os
+sem sensor ligado. Campo de estação conhecida cujo identificador não tem sensor
+cadastrado nela (`unknown_sensor`) não é erro: fica em `telemetry_results` com
+destino `ignored`, sem leitura e sem quarentena. O payload original continua em
+`telemetry_events`; cadastrado o sensor, as próximas mensagens já são gravadas.
+Estação desconhecida, sensor ambíguo e valor inválido continuam na quarentena.
+Exige a migration 023 do BANCO (verificada na inicialização).
 
 A SCRUM-451 integra esses destinos em uma transação PostgreSQL: leituras fora dos
 limites mantêm o valor exato e `data_consistent=false`, com ocorrência

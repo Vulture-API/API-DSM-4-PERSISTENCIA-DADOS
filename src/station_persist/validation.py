@@ -19,6 +19,7 @@ from station_persist.relationships import (
     CatalogConnection,
     EventResolution,
     FieldResolution,
+    RejectionReason,
     UnrepresentableNumber,
     parse_json_decimal,
     resolve_entries,
@@ -48,6 +49,9 @@ class ValidationStatus(StrEnum):
     VALID = "valid"
     OUT_OF_RANGE = "out_of_range"
     REJECTED = "rejected"
+    # SCRUM-624: the datalogger sends every board channel; a channel with no
+    # sensor registered at the station is not an error.
+    IGNORED = "ignored"
 
 
 class TimestampSource(StrEnum):
@@ -288,7 +292,9 @@ async def validate_entries(
             reasons = field.reasons + time.reasons
             number = raw = None
             status = ValidationStatus.REJECTED
-            if not reasons:
+            if reasons == (RejectionReason.UNKNOWN_SENSOR,):
+                status = ValidationStatus.IGNORED
+            elif not reasons:
                 number, reason = exact_numeric(field.value)
                 raw = number
                 if reason is None and not calibration.identity:
