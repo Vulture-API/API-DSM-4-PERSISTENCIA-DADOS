@@ -31,6 +31,13 @@ _MAX_UNIX = 253402300799
 _MAX_RECEIVED_MS = _MAX_UNIX * 1000 + 999
 _STREAM_ID = re.compile(r"(0|[1-9][0-9]*)-(0|[1-9][0-9]*)")
 _UINT64_MAX = 18446744073709551615
+# SCRUM-632: horário da medida aceito até 5 min à frente do recebimento
+# (diferença entre relógios); além disso o evento vai para a quarentena.
+FUTURE_TOLERANCE_S = 300
+# Campo sem leitura e sem quarentena: o payload original continua no evento.
+_IGNORED_REASONS = frozenset(
+    {(RejectionReason.UNKNOWN_SENSOR,), (RejectionReason.INACTIVE_SENSOR,)}
+)
 
 
 class _IntegerToken(str):
@@ -185,6 +192,10 @@ def _timestamp(
         return TimestampValidation(
             received_at_ms=received, reasons=("timestamp_not_representable",)
         )
+    if int(digits) > received // 1000 + FUTURE_TOLERANCE_S:
+        return TimestampValidation(
+            received_at_ms=received, reasons=("timestamp_in_future",)
+        )
     return TimestampValidation(int(digits), received, TimestampSource.PAYLOAD)
 
 
@@ -215,7 +226,7 @@ async def validate_entries(
             "OR a.attrelid = to_regclass('sensors') "
             "AND a.attname IN ('min_value','max_value','gain','offset_value') "
             "OR a.attrelid = to_regclass('sensor_types') "
-            "AND a.attname IN ('factor','gain','offset_value')) "
+            "AND a.attname IN ('factor','gain','offset_value','min_value','max_value')) "
             "AND NOT a.attisdropped"
         )
         if {(row["relname"], row["attname"]) for row in schema} != {
@@ -227,15 +238,18 @@ async def validate_entries(
             ("sensor_types", "factor"),
             ("sensor_types", "gain"),
             ("sensor_types", "offset_value"),
+            ("sensor_types", "min_value"),
+            ("sensor_types", "max_value"),
         } or not all(row["exact"] for row in schema):
             raise CatalogConfigurationError(
-                "Apply BANCO migration 016 and migration 021: "
+                "Apply BANCO migrations 016, 021 and 024: "
                 "unconstrained NUMERIC required"
             )
         rows = await connection.fetch(
             "SELECT s.id, s.station_id, s.min_value, s.max_value, "
             "s.gain, s.offset_value, t.factor AS type_factor, "
-            "t.gain AS type_gain, t.offset_value AS type_offset "
+            "t.gain AS type_gain, t.offset_value AS type_offset, "
+            "t.min_value AS type_min, t.max_value AS type_max "
             "FROM sensors s JOIN sensor_types t ON t.id = s.sensor_type_id "
             "WHERE s.id = ANY($1::integer[])",
             ids,
@@ -243,8 +257,12 @@ async def validate_entries(
         for row in rows:
             if row["id"] in catalog:
                 raise CatalogConfigurationError("Duplicate sensor in limit catalog")
+            # SCRUM-632: valem os limites do sensor; sem nenhum, os do tipo.
+            keys = ("min_value", "max_value")
+            if row["min_value"] is None and row["max_value"] is None:
+                keys = ("type_min", "type_max")
             limits = []
-            for key in ("min_value", "max_value"):
+            for key in keys:
                 limit = row[key]
                 if limit is not None:
                     limit, reason = exact_numeric(limit)
@@ -292,7 +310,7 @@ async def validate_entries(
             reasons = field.reasons + time.reasons
             number = raw = None
             status = ValidationStatus.REJECTED
-            if reasons == (RejectionReason.UNKNOWN_SENSOR,):
+            if reasons in _IGNORED_REASONS:
                 status = ValidationStatus.IGNORED
             elif not reasons:
                 number, reason = exact_numeric(field.value)

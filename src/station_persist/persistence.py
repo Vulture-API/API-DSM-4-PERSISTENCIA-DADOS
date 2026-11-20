@@ -86,8 +86,16 @@ async def validate_storage_schema(conn: Any) -> None:
             "max_value",
             "gain",
             "offset_value",
+            "operational_status",
         },
-        "sensor_types": {"id", "factor", "gain", "offset_value"},
+        "sensor_types": {
+            "id",
+            "factor",
+            "gain",
+            "offset_value",
+            "min_value",
+            "max_value",
+        },
     }
     required["telemetry_events"].add("legacy_max_id")
     required["telemetry_replay_requests"] = {
@@ -204,6 +212,8 @@ async def validate_storage_schema(conn: Any) -> None:
             ("sensor_types", "factor"),
             ("sensor_types", "gain"),
             ("sensor_types", "offset_value"),
+            ("sensor_types", "min_value"),
+            ("sensor_types", "max_value"),
             ("occurrences", "value"),
         }
         <= exact
@@ -224,7 +234,7 @@ async def validate_storage_schema(conn: Any) -> None:
         or not ignored_destination
     ):
         raise CatalogConfigurationError(
-            "Apply BANCO migrations 016 (both), 017, 018, 021 and 023 before consume"
+            "Apply BANCO migrations 016 (both), 017, 018, 021, 023 and 024 before consume"
         )
 
 
