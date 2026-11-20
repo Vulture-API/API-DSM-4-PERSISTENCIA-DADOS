@@ -111,7 +111,8 @@ Regras de associação:
 | `invalid_payload` | JSON ausente, inválido, não objeto ou com chaves repetidas. |
 | `invalid_identification` | Identificação ausente ou fora do formato aceito, no Stream ou payload. |
 | `identification_out_of_range` | ID legado não cabe em integer PostgreSQL. |
-| `identification_mismatch` | Identidades normalizadas do Stream e payload divergem. |
+| `identification_mismatch` | Identidades normalizadas do Stream, do payload ou do tópico (`estacoes/<id>/dados`) divergem, ou o tópico está fora do padrão (SCRUM-632). Entrada sem tópico não é conferida. |
+| `inactive_sensor` | Sensor cadastrado com `operational_status` falso (SCRUM-632): o campo fica `ignored`, sem leitura e sem quarentena. |
 | `invalid_sensor_identifier` | Chave contém NUL ou surrogate Unicode e não pode ser comparada em PostgreSQL; valor e origem continuam preservados. |
 | `unknown_station` / `unknown_sensor` | Referência inexistente no escopo consultado. Um identificador que existe só em outra estação continua desconhecido nesta estação. |
 | `ambiguous_station` / `ambiguous_sensor` | Mais de um cadastro corresponde à mesma referência normalizada. |
@@ -219,7 +220,10 @@ valor = bruto × fator × ganho + offset
 A fonte de `unix_time` é o payload, não o campo extraído do Stream. Exige token
 inteiro JSON não negativo; textos, booleanos, null, `1.0` e `1e0` não são inteiros
 JSON aceitos. O intervalo UTC suportado pelo serviço é de 0 a 253402300799 segundos
-(1970 até o fim de 9999), dentro de BIGINT. Não existe janela de atraso/futuro.
+(1970 até o fim de 9999), dentro de BIGINT. Não há limite de atraso; horário mais
+de 5 minutos à frente de `received_at` (diferença entre relógios) gera
+`timestamp_in_future` e o evento vai para a quarentena (SCRUM-632), para que uma
+leitura do futuro não vire o valor atual da estação.
 `received_at` é obrigatório, inteiro textual não negativo em ms, até
 253402300799999. Ausência/invalidez gera `invalid_received_at` ou
 `received_at_not_representable`; timestamp informado incorretamente gera
@@ -270,6 +274,14 @@ destino `ignored`, sem leitura e sem quarentena. O payload original continua em
 `telemetry_events`; cadastrado o sensor, as próximas mensagens já são gravadas.
 Estação desconhecida, sensor ambíguo e valor inválido continuam na quarentena.
 Exige a migration 023 do BANCO (verificada na inicialização).
+
+Sensor desativado (`inactive_sensor`, SCRUM-632) segue o mesmo caminho do
+`ignored`: sem leitura e sem quarentena, com o payload preservado no evento.
+
+Limites (SCRUM-632): valem o mínimo e o máximo do sensor; se o sensor não tem
+nenhum dos dois, valem os do tipo (`sensor_types.min_value`/`max_value`, migration
+024 do BANCO). Fora da faixa, a leitura é gravada como inconsistente. A
+inicialização exige a migration 024.
 
 A SCRUM-451 integra esses destinos em uma transação PostgreSQL: leituras fora dos
 limites mantêm o valor exato e `data_consistent=false`, com ocorrência

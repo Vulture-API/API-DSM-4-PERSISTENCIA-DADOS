@@ -26,6 +26,8 @@ class RejectionReason(StrEnum):
     UNKNOWN_STATION = "unknown_station"
     AMBIGUOUS_STATION = "ambiguous_station"
     UNKNOWN_SENSOR = "unknown_sensor"
+    # SCRUM-632: sensor desativado no cadastro (operational_status falso).
+    INACTIVE_SENSOR = "inactive_sensor"
     INVALID_SENSOR_IDENTIFIER = "invalid_sensor_identifier"
     AMBIGUOUS_SENSOR = "ambiguous_sensor"
     DUPLICATE_SENSOR = "duplicate_sensor"
@@ -131,7 +133,9 @@ def _invalid_sensor_identifier(value: str) -> bool:
     return "\x00" in value
 
 
-def _prepare(entry: StreamEntry) -> tuple[EventResolution, StationIdentity | None]:
+def _prepare(
+    entry: StreamEntry,
+) -> tuple[EventResolution, StationIdentity | None, StationIdentity | None]:
     try:
         payload = json.loads(
             entry.fields["payload"],
@@ -143,9 +147,11 @@ def _prepare(entry: StreamEntry) -> tuple[EventResolution, StationIdentity | Non
         if not isinstance(payload, dict):
             raise ValueError("Payload must be an object")
     except (KeyError, ValueError, RecursionError):
-        return EventResolution(
-            entry, None, None, (), (RejectionReason.INVALID_PAYLOAD,)
-        ), None
+        return (
+            EventResolution(entry, None, None, (), (RejectionReason.INVALID_PAYLOAD,)),
+            None,
+            None,
+        )
     fields = tuple(
         FieldResolution(
             key,
@@ -164,8 +170,30 @@ def _prepare(entry: StreamEntry) -> tuple[EventResolution, StationIdentity | Non
             reason = RejectionReason.IDENTIFICATION_MISMATCH
     event = EventResolution(entry, None, None, fields)
     if reason is not None:
-        return _reject_event(event, reason), None
-    return event, identity
+        return _reject_event(event, reason), None, None
+    topic_identity, topic_reason = topic_station_identity(entry.fields.get("topic"))
+    if topic_reason is not None:
+        return _reject_event(event, topic_reason), None, None
+    return event, identity, topic_identity
+
+
+def topic_station_identity(
+    topic: str | None,
+) -> tuple[StationIdentity | None, RejectionReason | None]:
+    """SCRUM-632: a estação do tópico estacoes/<id>/dados.
+
+    Entrada sem tópico (anterior à recepção atual) não é conferida. Tópico fora
+    do padrão ou com identificação inválida não deixa conferir a estação.
+    """
+    if topic is None or topic == "":
+        return None, None
+    parts = topic.split("/")
+    if len(parts) != 3 or not parts[1]:
+        return None, RejectionReason.IDENTIFICATION_MISMATCH
+    identity, reason = station_identity(parts[1])
+    if reason is not None:
+        return None, RejectionReason.IDENTIFICATION_MISMATCH
+    return identity, None
 
 
 def _reject_event(event: EventResolution, reason: RejectionReason) -> EventResolution:
@@ -189,7 +217,7 @@ WITH requested AS (
 )
 SELECT r.station_id AS requested_station_id,
        r.local_identifier AS requested_identifier,
-       s.id AS sensor_id, s.station_id, s.sensor_type_id
+       s.id AS sensor_id, s.station_id, s.sensor_type_id, s.operational_status
 FROM requested r
 JOIN sensors s ON s.station_id = r.station_id
              AND lower(s.local_identifier) = lower(r.local_identifier)
@@ -206,9 +234,14 @@ async def resolve_entries(
     No cache, transaction, ProcessingResult or persistence is owned here.
     """
     prepared = [_prepare(entry) for entry in entries]
-    identities = {identity for _, identity in prepared if identity is not None}
+    identities = {
+        identity
+        for _, payload_identity, topic_identity in prepared
+        for identity in (payload_identity, topic_identity)
+        if identity is not None
+    }
     if not identities:
-        return tuple(event for event, _ in prepared)
+        return tuple(event for event, _, _ in prepared)
     rows = await connection.fetch(
         _STATIONS_SQL,
         sorted(identity.value for identity in identities if identity.kind == "id"),
@@ -223,7 +256,7 @@ async def resolve_entries(
             stations[mac].append(row)
 
     events = []
-    for event, identity in prepared:
+    for event, identity, topic_identity in prepared:
         if identity is None:
             events.append(event)
             continue
@@ -232,6 +265,11 @@ async def resolve_entries(
             events.append(_reject_event(event, RejectionReason.UNKNOWN_STATION))
         elif len(candidates) != 1:
             events.append(_reject_event(event, RejectionReason.AMBIGUOUS_STATION))
+        elif topic_identity is not None and [
+            row["id"] for row in stations[topic_identity]
+        ] != [candidates[0]["id"]]:
+            # Uma estação não publica com a identificação de outra.
+            events.append(_reject_event(event, RejectionReason.IDENTIFICATION_MISMATCH))
         elif candidates[0]["property_id"] is None:
             events.append(_reject_event(event, RejectionReason.INCOMPATIBLE_REFERENCE))
         else:
@@ -286,6 +324,8 @@ async def resolve_entries(
                 field = replace(
                     field, reasons=(RejectionReason.INCOMPATIBLE_REFERENCE,)
                 )
+            elif candidates[0].get("operational_status") is False:
+                field = replace(field, reasons=(RejectionReason.INACTIVE_SENSOR,))
             else:
                 field = replace(
                     field,
