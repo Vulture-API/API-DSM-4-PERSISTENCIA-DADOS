@@ -52,6 +52,7 @@ async def storage():
             "migrations/018_telemetry_recovery_and_replay.sql",
             "migrations/021_sensor_calibration.sql",
             "migrations/023_telemetry_ignored_fields.sql",
+            "migrations/024_sensor_type_limits.sql",
         ):
             await conn.execute((root / file).read_text())
         await conn.execute("""
@@ -83,13 +84,15 @@ def entry(
     entry_id="1-0",
     **fields,
 ):
+    # SCRUM-632: o tópico identifica a mesma estação do payload.
+    topic = f"estacoes/{fields['estacao_id']}/dados" if "estacao_id" in fields else None
     return StreamEntry.from_redis(
         entry_id,
         dict(
             estacao_id="1",
             unix_time="1760000000",
             received_at="1760000000123",
-            topic="estacoes/AA:BB:CC:DD:EE:01/dados",
+            topic=topic or "estacoes/AA:BB:CC:DD:EE:01/dados",
             payload=payload,
         )
         | fields,
@@ -224,6 +227,89 @@ async def test_real_unknown_station_is_still_quarantined(storage):
         )
         == 0
     )
+
+
+# SCRUM-633: horário futuro, sensor desativado, estação do tópico e limites do tipo.
+
+
+@pytest.mark.asyncio
+async def test_real_future_timestamp_goes_to_quarantine(storage):
+    conn, pool, _ = storage
+    await persist(
+        pool,
+        entry('{"unix_time":1760000301,"temp":21.5}', received_at="1760000000000"),
+    )
+    assert await counts(conn) == (0, 0, 1, 1, 1)
+    assert await conn.fetchval("SELECT reasons FROM telemetry_quarantine") == [
+        "timestamp_in_future"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_real_five_minutes_ahead_is_still_a_reading(storage):
+    conn, pool, _ = storage
+    await persist(
+        pool,
+        entry('{"unix_time":1760000300,"temp":21.5}', received_at="1760000000000"),
+    )
+    assert await conn.fetchval("SELECT unix_time FROM readings") == 1760000300
+
+
+@pytest.mark.asyncio
+async def test_real_inactive_sensor_is_ignored_without_reading(storage):
+    conn, pool, _ = storage
+    await conn.execute("UPDATE sensors SET operational_status=false WHERE id=1")
+    source = entry('{"unix_time":1760000000,"temp":21.5,"humidity":60}')
+    assert await persist(pool, source) is ProcessingResult.COMPLETED
+    assert await counts(conn) == (1, 0, 1, 0, 2)
+    assert await conn.fetchrow(
+        "SELECT sensor_id,reading_id,quarantine_id,reasons FROM telemetry_results "
+        "WHERE destination='ignored'"
+    ) == (None, None, None, ["inactive_sensor"])
+    assert await conn.fetchval("SELECT sensor_id FROM readings") == 2
+    assert json.loads(
+        await conn.fetchval("SELECT original_fields FROM telemetry_events")
+    ) == dict(source.fields)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "topic", ["estacoes/AA:BB:CC:DD:EE:02/dados", "estacoes/2/dados", "outro/topico"]
+)
+async def test_real_topic_of_another_station_goes_to_quarantine(storage, topic):
+    conn, pool, _ = storage
+    await persist(pool, entry('{"unix_time":1760000000,"temp":21.5}', topic=topic))
+    assert await counts(conn) == (0, 0, 1, 1, 1)
+    assert await conn.fetchval("SELECT reasons FROM telemetry_quarantine") == [
+        "identification_mismatch"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_real_type_limits_make_negative_rain_inconsistent(storage):
+    conn, pool, _ = storage
+    await conn.execute(
+        "INSERT INTO sensor_types(id,name,unit_of_measure,min_value) VALUES(2,'rain','mm',0); "
+        "INSERT INTO sensors(id,station_id,sensor_type_id,local_identifier,gain) "
+        "VALUES(10,1,2,'pu26',0.125),(11,1,2,'pu27',0.125)"
+    )
+    await conn.execute("UPDATE sensors SET min_value=-1 WHERE id=11")
+    await persist(pool, entry('{"unix_time":1760000000,"pu26":-4,"pu27":-4}'))
+    assert await conn.fetch(
+        "SELECT sensor_id,value,data_consistent FROM readings ORDER BY sensor_id"
+    ) == [(10, Decimal("-0.500"), False), (11, Decimal("-0.500"), True)]
+
+
+@pytest.mark.asyncio
+async def test_real_schema_guard_requires_type_limits(storage):
+    conn, _, _ = storage
+    await validate_storage_schema(conn)
+    await conn.execute(
+        "ALTER TABLE sensor_types DROP CONSTRAINT sensor_types_limits_valid; "
+        "ALTER TABLE sensor_types DROP COLUMN min_value, DROP COLUMN max_value"
+    )
+    with pytest.raises(CatalogConfigurationError, match="024"):
+        await validate_storage_schema(conn)
 
 
 @pytest.mark.asyncio

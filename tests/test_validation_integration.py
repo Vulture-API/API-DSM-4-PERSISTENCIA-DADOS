@@ -79,7 +79,7 @@ async def test_real_validation_snapshot_catalog_refresh_and_schema_failure(catal
         (new,) = await validate_entries([event()], conn)
         assert new.fields[0].status == Status.VALID
         await conn.execute("ALTER TABLE readings ALTER value TYPE decimal(10,2)")
-        with pytest.raises(CatalogConfigurationError, match="migration 016"):
+        with pytest.raises(CatalogConfigurationError, match="016"):
             await validate_entries([event()], conn)
         await conn.execute("ALTER TABLE sensors DROP COLUMN min_value")
         with pytest.raises(CatalogConfigurationError):

@@ -41,7 +41,8 @@ async def catalog():
             );
             CREATE TABLE sensor_types(
                 id integer PRIMARY KEY,
-                factor numeric NULL, gain numeric NULL, offset_value numeric NULL
+                factor numeric NULL, gain numeric NULL, offset_value numeric NULL,
+                min_value numeric NULL, max_value numeric NULL
             );
             CREATE TABLE sensors(
                 id integer PRIMARY KEY,
@@ -50,6 +51,7 @@ async def catalog():
                 local_identifier varchar(50) NOT NULL,
                 min_value numeric NULL, max_value numeric NULL,
                 gain numeric NULL, offset_value numeric NULL,
+                operational_status boolean NOT NULL DEFAULT true,
                 UNIQUE(station_id, local_identifier)
             );
             CREATE TABLE readings(
@@ -82,8 +84,8 @@ def event(identity="1", payload='{"temp":12}', entry_id="1-0"):
             "estacao_id": identity,
             "payload": payload,
             "unix_time": "null",
-            "received_at": "1234567890000",
-            "topic": "estacoes/AA:BB:CC:DD:EE:02/dados",
+            "received_at": "1760000060000",
+            "topic": f"estacoes/{identity}/dados",
             "legacy": "original",
         },
     )

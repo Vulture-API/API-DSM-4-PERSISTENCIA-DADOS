@@ -203,5 +203,5 @@ async def test_schema_without_the_calibration_columns_asks_for_the_migration():
     rows = list(conn.fetch.side_effect)
     rows[2] = rows[2][:3]
     conn.fetch.side_effect = rows
-    with pytest.raises(CatalogConfigurationError, match="migration 021"):
+    with pytest.raises(CatalogConfigurationError, match="021"):
         await validate_entries([entry()], conn)
