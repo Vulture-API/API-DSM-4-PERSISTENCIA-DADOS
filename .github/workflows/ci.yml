@@ -31,7 +31,7 @@ jobs:
     steps:
       - name: Conferir se o conteúdo já foi testado no PR
         id: conferir
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const sha = context.sha;
@@ -115,17 +115,17 @@ jobs:
       TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/telemetry_test
       BANCO_SCHEMA_DIR: ${{ github.workspace }}/contracts/banco
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Checkout versioned BANCO contract (SCRUM-530)
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           repository: Vulture-API/API-DSM-4-BANCO
           ref: c1bbd7ff76ae8646bc9d1ac41cfcd1f3dc1e90f8
           path: contracts/banco
           persist-credentials: false
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: Install
@@ -155,7 +155,7 @@ jobs:
           echo "### Cobertura de linhas: ${COVERAGE}% (mínimo 80%)" >> "$GITHUB_STEP_SUMMARY"
       - name: Package
         run: python -m build
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: verification
@@ -172,7 +172,7 @@ jobs:
     if: ${{ !cancelled() && needs.verify.result == 'success' }}
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Docker build and non-root check
@@ -194,7 +194,7 @@ jobs:
     steps:
       - name: Criar ou atualizar o comentário do CI
         continue-on-error: true
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         env:
           VERIFY: ${{ needs.verify.result }}
           DOCKER: ${{ needs.docker.result }}
