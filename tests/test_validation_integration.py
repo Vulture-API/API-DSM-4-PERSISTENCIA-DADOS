@@ -42,7 +42,7 @@ async def test_real_validation_exact_values_limits_partial_results(catalog):
         Status.OUT_OF_RANGE,
         Status.REJECTED,
         Status.VALID,
-        Status.REJECTED,
+        Status.IGNORED,
     ]
     assert result.fields[0].reasons == ("above_max",)
     assert result.fields[1].resolution.value is True
@@ -79,7 +79,7 @@ async def test_real_validation_snapshot_catalog_refresh_and_schema_failure(catal
         (new,) = await validate_entries([event()], conn)
         assert new.fields[0].status == Status.VALID
         await conn.execute("ALTER TABLE readings ALTER value TYPE decimal(10,2)")
-        with pytest.raises(CatalogConfigurationError, match="migration 016"):
+        with pytest.raises(CatalogConfigurationError, match="016"):
             await validate_entries([event()], conn)
         await conn.execute("ALTER TABLE sensors DROP COLUMN min_value")
         with pytest.raises(CatalogConfigurationError):

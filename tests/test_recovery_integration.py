@@ -252,15 +252,17 @@ async def do_replay(pool, qid, **kwargs):
     )
 
 
-async def test_real_replay_unknown_sensor_immutable_and_request_idempotency(storage):
+async def test_real_replay_unknown_station_immutable_and_request_idempotency(storage):
     conn, pool, _ = storage
     await persist(
-        pool, entry('{"unix_time":1760000000,"temp":20,"new":23.1234567890123456789}')
+        pool,
+        entry('{"unix_time":1760000000,"new":23.1234567890123456789}', estacao_id="99"),
     )
     original = await conn.fetchrow("SELECT * FROM telemetry_events")
     q = await conn.fetchrow("SELECT * FROM telemetry_quarantine")
     await conn.execute(
-        "INSERT INTO sensors(id,station_id,sensor_type_id,local_identifier) VALUES(10,1,1,'new')"
+        "INSERT INTO stations(id,property_id,name,mac_address) VALUES(99,1,'added','AA:BB:CC:DD:EE:99'); "
+        "INSERT INTO sensors(id,station_id,sensor_type_id,local_identifier) VALUES(10,99,1,'new')"
     )
     request = str(uuid4())
     dry = await do_replay(pool, q["id"], request_id=request, dry_run=True)
@@ -269,7 +271,7 @@ async def test_real_replay_unknown_sensor_immutable_and_request_idempotency(stor
     outcome = await do_replay(pool, q["id"], request_id=request)
     assert (outcome.status, outcome.accepted, outcome.rejected) == ("SUCCEEDED", 1, 0)
     assert await do_replay(pool, q["id"], request_id=request) == outcome
-    assert await conn.fetchval("SELECT count(*) FROM readings") == 2
+    assert await conn.fetchval("SELECT count(*) FROM readings") == 1
     assert await conn.fetchrow("SELECT * FROM telemetry_events") == original
     assert (await conn.fetchrow("SELECT * FROM telemetry_quarantine"))["reasons"] == q[
         "reasons"
@@ -367,10 +369,11 @@ async def test_real_replay_failure_is_audited_and_same_request_can_retry(
     storage, monkeypatch, cancel
 ):
     conn, pool, _ = storage
-    await persist(pool, entry('{"new":25}'))
+    await persist(pool, entry('{"new":25}', estacao_id="99"))
     qid = await conn.fetchval("SELECT id FROM telemetry_quarantine")
     await conn.execute(
-        "INSERT INTO sensors(id,station_id,sensor_type_id,local_identifier) VALUES(10,1,1,'new')"
+        "INSERT INTO stations(id,property_id,name,mac_address) VALUES(99,1,'added','AA:BB:CC:DD:EE:99'); "
+        "INSERT INTO sensors(id,station_id,sensor_type_id,local_identifier) VALUES(10,99,1,'new')"
     )
     entered = asyncio.Event()
     original = replay.write_measurement
@@ -403,10 +406,11 @@ async def test_real_replay_concurrent_request_is_busy_and_response_loss_does_not
     storage, monkeypatch
 ):
     conn, pool, _ = storage
-    await persist(pool, entry('{"new":25}'))
+    await persist(pool, entry('{"new":25}', estacao_id="99"))
     qid = await conn.fetchval("SELECT id FROM telemetry_quarantine")
     await conn.execute(
-        "INSERT INTO sensors(id,station_id,sensor_type_id,local_identifier) VALUES(10,1,1,'new')"
+        "INSERT INTO stations(id,property_id,name,mac_address) VALUES(99,1,'added','AA:BB:CC:DD:EE:99'); "
+        "INSERT INTO sensors(id,station_id,sensor_type_id,local_identifier) VALUES(10,99,1,'new')"
     )
     entered, release = asyncio.Event(), asyncio.Event()
     original = replay.write_measurement
@@ -437,7 +441,7 @@ async def test_real_status_quarantine_metadata_and_no_redis_for_replay(
     from station_persist.stream import StreamEntry
 
     await process_entry(
-        StreamEntry.from_redis(identifier, dict(entry('{"bad":true}').fields)),
+        StreamEntry.from_redis(identifier, dict(entry('{"temp":true}').fields)),
         pool,
         source_id=s.source_id,
         stream=s.stream,
@@ -454,7 +458,7 @@ async def test_real_status_quarantine_metadata_and_no_redis_for_replay(
     listed = await run_operation(s, "quarantine", action="list", limit=1)
     assert listed["items"][0]["id"] == qid and listed["next_after_id"] == qid
     shown = await run_operation(s, "quarantine", action="show", quarantine_id=qid)
-    assert shown["reasons"] == ["unknown_sensor"] and shown["attempts"] == []
+    assert shown["reasons"] == ["invalid_numeric_type"] and shown["attempts"] == []
     result = await run_operation(
         s,
         "quarantine",
@@ -471,10 +475,11 @@ async def test_real_status_quarantine_metadata_and_no_redis_for_replay(
 
 async def test_real_replay_two_requests_for_same_event_serialize(storage):
     conn, pool, _ = storage
-    await persist(pool, entry('{"new":25}'))
+    await persist(pool, entry('{"new":25}', estacao_id="99"))
     qid = await conn.fetchval("SELECT id FROM telemetry_quarantine")
     await conn.execute(
-        "INSERT INTO sensors(id,station_id,sensor_type_id,local_identifier) VALUES(10,1,1,'new')"
+        "INSERT INTO stations(id,property_id,name,mac_address) VALUES(99,1,'added','AA:BB:CC:DD:EE:99'); "
+        "INSERT INTO sensors(id,station_id,sensor_type_id,local_identifier) VALUES(10,99,1,'new')"
     )
     results = await asyncio.gather(do_replay(pool, qid), do_replay(pool, qid))
     assert all(r.status == "SUCCEEDED" for r in results)
@@ -485,10 +490,11 @@ async def test_real_replay_two_requests_for_same_event_serialize(storage):
 
 async def test_real_replay_ambiguous_commit_retries_without_repeating_effects(storage):
     conn, pool, _ = storage
-    await persist(pool, entry('{"new":25}'))
+    await persist(pool, entry('{"new":25}', estacao_id="99"))
     qid = await conn.fetchval("SELECT id FROM telemetry_quarantine")
     await conn.execute(
-        "INSERT INTO sensors(id,station_id,sensor_type_id,local_identifier) VALUES(10,1,1,'new')"
+        "INSERT INTO stations(id,property_id,name,mac_address) VALUES(99,1,'added','AA:BB:CC:DD:EE:99'); "
+        "INSERT INTO sensors(id,station_id,sensor_type_id,local_identifier) VALUES(10,99,1,'new')"
     )
     lost = [True]
 

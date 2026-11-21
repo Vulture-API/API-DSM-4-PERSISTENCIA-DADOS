@@ -107,7 +107,7 @@ async def _execute(conn, row, attempt_id):
         reasons = field.reasons
         if "conflicting_measurement" in row["reasons"] or ordinal in conflicts:
             reasons = ("conflicting_measurement",)
-        elif field.destination != Destination.QUARANTINE:
+        elif field.destination not in (Destination.QUARANTINE, Destination.IGNORED):
             result = await write_measurement(
                 conn, event.resolution.station_id, event.timestamp.unix_time, field
             )
@@ -179,7 +179,7 @@ async def _replay_once(
             accepted = rejected = 0
             for field in fields if row["quarantine_status"] != "RESOLVED" else []:
                 blocked = (
-                    field.destination == Destination.QUARANTINE
+                    field.destination in (Destination.QUARANTINE, Destination.IGNORED)
                     or "conflicting_measurement" in row["reasons"]
                     or field.ordinal in conflicts
                 )
