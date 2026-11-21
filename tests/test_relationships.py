@@ -12,14 +12,15 @@ from station_persist.relationships import resolve_entries, station_identity
 from station_persist.stream import StreamEntry
 
 
-def entry(identity="1", payload=None, *, raw=None, entry_id="1-0"):
+def entry(identity="1", payload=None, *, raw=None, entry_id="1-0", topic=None):
     return StreamEntry.from_redis(
         entry_id,
         {
             "estacao_id": identity,
             "unix_time": "null",
             "received_at": "1234567890000",
-            "topic": "estacoes/WRONG/dados",
+            # SCRUM-632: o tópico identifica a mesma estação do payload.
+            "topic": topic if topic is not None else f"estacoes/{identity}/dados",
             "payload": raw if raw is not None else json.dumps(payload or {}),
             "legacy": "preserved",
         },
@@ -238,3 +239,78 @@ async def test_non_postgres_key_and_unbounded_json_number_remain_data_rejections
     assert result.fields[2].value == Decimal("9" * 5000)
     assert result.source is source
     assert conn.fetch.await_args.args[2] == ["temp"]
+
+
+# SCRUM-633: estação do tópico e sensor desativado.
+
+
+@pytest.mark.asyncio
+async def test_topic_with_the_same_station_by_mac_or_id_is_accepted():
+    conn = AsyncMock()
+    conn.fetch.side_effect = [[station()], [sensor()]]
+    (result,) = await resolve_entries(
+        [entry("1", {"temp": 3}, topic="estacoes/AA:BB:CC:DD:EE:01/dados")], conn
+    )
+    assert not result.reasons
+    assert result.station_id == 1
+    assert result.fields[0].sensor_id == 20
+
+
+@pytest.mark.asyncio
+async def test_topic_with_another_station_is_identification_mismatch():
+    conn = AsyncMock()
+    conn.fetch.side_effect = [[station(), station(id=2, mac="AA:BB:CC:DD:EE:02")]]
+    (result,) = await resolve_entries(
+        [entry("1", {"temp": 3}, topic="estacoes/2/dados")], conn
+    )
+    assert result.reasons == (Reason.IDENTIFICATION_MISMATCH,)
+    assert result.fields[0].reasons == (Reason.IDENTIFICATION_MISMATCH,)
+    assert result.station_id is None
+    assert conn.fetch.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_topic_with_unknown_station_is_identification_mismatch():
+    conn = AsyncMock()
+    conn.fetch.side_effect = [[station()]]
+    (result,) = await resolve_entries(
+        [entry("1", {"temp": 3}, topic="estacoes/99/dados")], conn
+    )
+    assert result.reasons == (Reason.IDENTIFICATION_MISMATCH,)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "topic",
+    ["estacoes/1", "estacoes//dados", "estacoes/1/dados/extra", "estacoes/WRONG/dados"],
+)
+async def test_topic_out_of_pattern_is_identification_mismatch(topic):
+    conn = AsyncMock()
+    (result,) = await resolve_entries([entry("1", {"temp": 3}, topic=topic)], conn)
+    assert result.reasons == (Reason.IDENTIFICATION_MISMATCH,)
+    conn.fetch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_entry_without_topic_is_not_checked():
+    conn = AsyncMock()
+    conn.fetch.side_effect = [[station()], [sensor()]]
+    (result,) = await resolve_entries([entry("1", {"temp": 3}, topic="")], conn)
+    assert not result.reasons
+    assert result.fields[0].sensor_id == 20
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operational", "reasons"),
+    [(False, (Reason.INACTIVE_SENSOR,)), (True, ()), (None, ())],
+)
+async def test_inactive_sensor_is_marked_and_active_is_resolved(operational, reasons):
+    conn = AsyncMock()
+    conn.fetch.side_effect = [
+        [station()],
+        [dict(sensor(), operational_status=operational)],
+    ]
+    (result,) = await resolve_entries([entry("1", {"temp": 3})], conn)
+    assert result.fields[0].reasons == reasons
+    assert not result.reasons

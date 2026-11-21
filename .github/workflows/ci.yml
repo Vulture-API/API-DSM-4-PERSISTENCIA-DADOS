@@ -1,17 +1,94 @@
 name: CI
+# A suíte completa roda no PR para a dev: é a pipeline da feature. No push da
+# dev, o job de procedência confere que entrou o mesmo conteúdo testado no PR e,
+# confirmado, não repete a suíte; sem prova, roda tudo. A main não tem gatilho:
+# a promoção usa o que ficou registrado no commit da dev.
 on:
-  push:
-    branches: [dev, main, 'SCRUM-*', 'feature/SCRUM-*']
   pull_request:
-    branches: [dev, main, 'feature/SCRUM-*']
+    branches: [dev]
+  push:
+    branches: [dev]
   workflow_dispatch:
+
+# Em PR, commit novo cancela a execução antiga; na dev, cada merge tem a sua.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
 permissions:
   contents: read
 jobs:
+  procedencia:
+    name: Procedência do commit na dev
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    outputs:
+      testado: ${{ steps.conferir.outputs.testado }}
+    steps:
+      - name: Conferir se o conteúdo já foi testado no PR
+        id: conferir
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const sha = context.sha;
+            const roda = (motivo) => {
+              core.notice(`Suíte completa nesta execução: ${motivo}.`);
+              core.setOutput('testado', 'false');
+            };
+            try {
+              const { data: commit } = await github.rest.repos.getCommit({ ...context.repo, ref: sha });
+              if (commit.parents.length !== 2) return roda('o commit não é o merge de um PR');
+              const { data: prs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({ ...context.repo, commit_sha: sha });
+              const pr = prs.find((p) => p.merged_at && p.merge_commit_sha === sha);
+              if (!pr) return roda('nenhum PR mesclado gerou este commit');
+              const head = pr.head.sha;
+              const [{ data: merge }, { data: testado }] = await Promise.all([
+                github.rest.git.getCommit({ ...context.repo, commit_sha: sha }),
+                github.rest.git.getCommit({ ...context.repo, commit_sha: head }),
+              ]);
+              if (merge.tree.sha !== testado.tree.sha) return roda(`o conteúdo da dev difere do commit testado no PR #${pr.number}`);
+              const { data: comparacao } = await github.rest.repos.compareCommitsWithBasehead({
+                ...context.repo,
+                basehead: `${commit.parents[0].sha}...${head}`,
+              });
+              if (!['ahead', 'identical'].includes(comparacao.status)) return roda(`o PR #${pr.number} não estava atualizado com a dev`);
+              const workflow = process.env.GITHUB_WORKFLOW_REF.split('@')[0].split('/').pop();
+              const { data: runs } = await github.rest.actions.listWorkflowRuns({
+                ...context.repo,
+                workflow_id: workflow,
+                head_sha: head,
+                event: 'pull_request',
+                status: 'success',
+                per_page: 1,
+              });
+              const run = runs.workflow_runs[0];
+              if (!run) return roda(`não há CI verde no commit ${head.slice(0, 7)} do PR #${pr.number}`);
+              core.setOutput('testado', 'true');
+              await core.summary
+                .addHeading('Procedência confirmada', 3)
+                .addRaw(`O commit ${sha.slice(0, 7)} da dev tem o mesmo conteúdo do commit ${head.slice(0, 7)}, testado no PR #${pr.number}. `)
+                .addRaw('A suíte do repositório não roda de novo.')
+                .addBreak()
+                .addLink('Execução que testou este conteúdo', run.html_url)
+                .write();
+            } catch (erro) {
+              roda(`não foi possível conferir (${erro.message})`);
+            }
+
   verify:
+    needs: procedencia
+    # Roda no PR e em execução manual; no push da dev, só se a procedência não
+    # provar que este conteúdo já passou no PR.
+    if: ${{ !cancelled() && needs.procedencia.outputs.testado != 'true' }}
     name: Lint, testes e build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
+    outputs:
+      coverage: ${{ steps.coverage.outputs.coverage }}
     services:
       redis:
         image: redis:7-alpine
@@ -38,15 +115,17 @@ jobs:
       TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/telemetry_test
       BANCO_SCHEMA_DIR: ${{ github.workspace }}/contracts/banco
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - name: Checkout versioned BANCO contract (SCRUM-530)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: Vulture-API/API-DSM-4-BANCO
-          ref: 122afee72bee9201dcd58e9349aa2423dd3951a4
+          ref: c1bbd7ff76ae8646bc9d1ac41cfcd1f3dc1e90f8
           path: contracts/banco
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       - name: Install
@@ -66,9 +145,17 @@ jobs:
           assert cases and not list(root.iter('skipped')), 'Required tests were skipped'
           assert sum('test_real_' in case.attrib['name'] for case in cases) >= 2
           PY
+      - name: Coverage summary
+        id: coverage
+        if: always()
+        run: |
+          [ -f coverage.xml ] || exit 0
+          COVERAGE=$(python -c "import xml.etree.ElementTree as ET; print(int(float(ET.parse('coverage.xml').getroot().get('line-rate')) * 100))")
+          echo "coverage=${COVERAGE}" >> "$GITHUB_OUTPUT"
+          echo "### Cobertura de linhas: ${COVERAGE}% (mínimo 80%)" >> "$GITHUB_STEP_SUMMARY"
       - name: Package
         run: python -m build
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         if: always()
         with:
           name: verification
@@ -76,16 +163,67 @@ jobs:
             coverage.xml
             reports/
             dist/
+          retention-days: 30
 
   docker:
     name: Validar build da imagem Docker
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: verify
+    if: ${{ !cancelled() && needs.verify.result == 'success' }}
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - name: Docker build and non-root check
         run: |
           docker build -t station-persist:ci .
           test "$(docker run --rm --entrypoint id station-persist:ci -u)" != 0
           docker run --rm station-persist:ci --help
+
+  comment:
+    name: Comentar resultado no PR
+    runs-on: ubuntu-24.04
+    needs: [verify, docker]
+    if: >-
+      !cancelled() && github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Criar ou atualizar o comentário do CI
+        continue-on-error: true
+        uses: actions/github-script@v8
+        env:
+          VERIFY: ${{ needs.verify.result }}
+          DOCKER: ${{ needs.docker.result }}
+          COVERAGE: ${{ needs.verify.outputs.coverage }}
+        with:
+          script: |
+            const marker = '<!-- vulture-ci-report -->';
+            const ok = process.env.VERIFY === 'success' && process.env.DOCKER === 'success';
+            const coverage = process.env.COVERAGE || 'n/d';
+            const body = [
+              marker,
+              `${ok ? '✅' : '❌'} **Pipeline de CI: ${ok ? 'aprovado' : 'reprovado'}**`,
+              '',
+              `- Lint, testes e build: \`${process.env.VERIFY}\``,
+              `- Imagem Docker: \`${process.env.DOCKER}\``,
+              `- Cobertura de linhas: **${coverage}%** (mínimo 80%)`,
+              `- Commit: \`${context.payload.pull_request.head.sha.substring(0, 7)}\``,
+              `- [Ver execução completa](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`,
+            ].join('\n');
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              ...context.repo,
+              issue_number: context.issue.number,
+              per_page: 100,
+            });
+            const existing = comments.find((c) => c.body?.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({ ...context.repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ ...context.repo, issue_number: context.issue.number, body });
+            }

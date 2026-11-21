@@ -111,7 +111,8 @@ Regras de associação:
 | `invalid_payload` | JSON ausente, inválido, não objeto ou com chaves repetidas. |
 | `invalid_identification` | Identificação ausente ou fora do formato aceito, no Stream ou payload. |
 | `identification_out_of_range` | ID legado não cabe em integer PostgreSQL. |
-| `identification_mismatch` | Identidades normalizadas do Stream e payload divergem. |
+| `identification_mismatch` | Identidades normalizadas do Stream, do payload ou do tópico (`estacoes/<id>/dados`) divergem, ou o tópico está fora do padrão (SCRUM-632). Entrada sem tópico não é conferida. |
+| `inactive_sensor` | Sensor cadastrado com `operational_status` falso (SCRUM-632): o campo fica `ignored`, sem leitura e sem quarentena. |
 | `invalid_sensor_identifier` | Chave contém NUL ou surrogate Unicode e não pode ser comparada em PostgreSQL; valor e origem continuam preservados. |
 | `unknown_station` / `unknown_sensor` | Referência inexistente no escopo consultado. Um identificador que existe só em outra estação continua desconhecido nesta estação. |
 | `ambiguous_station` / `ambiguous_sensor` | Mais de um cadastro corresponde à mesma referência normalizada. |
@@ -186,12 +187,43 @@ ficam disponíveis para as SCRUM-449/451; rejeições alimentam as SCRUM-449/530
   limites invertidos/não finitos são erros de configuração, nunca limites ausentes.
   Catálogo alterado entre consultas sem snapshot gera erro técnico recuperável.
 
+### Calibração dos sensores (SCRUM-601)
+
+A estação envia a leitura bruta e o tratamento converte para a unidade do tipo
+antes de validar os limites e gravar:
+
+```
+valor = bruto × fator × ganho + offset
+```
+
+- `sensor_types.factor` é a conversão padrão do tipo. `gain` e `offset_value` são
+  a calibração: os de `sensors` valem no lugar dos de `sensor_types`. Campo NULL
+  não altera a leitura, então sensor sem calibração é gravado como recebido.
+- A conta é exata (`calibration.py`), sem ponto flutuante nem arredondamento do
+  contexto Decimal. Resultado que não cabe em NUMERIC é rejeitado com
+  `numeric_not_representable`.
+- `min_value`/`max_value`, `readings.value` e `occurrences.value` usam o valor
+  convertido. O valor bruto não é gravado em `readings`; continua no payload
+  original de `telemetry_events.original_fields`.
+- Leituras já gravadas não são recalculadas quando a calibração muda. Uma
+  medição reenviada (mesmo sensor e instante) depois da mudança não substitui a
+  leitura gravada nem cria outra: vai para a quarentena com
+  `conflicting_measurement`. Com a mesma calibração continua sendo duplicata.
+- Fator ou ganho zero, ou valor não finito no catálogo, é erro de configuração.
+- O schema deve conter `sensors.gain/offset_value` e
+  `sensor_types.factor/gain/offset_value` como NUMERIC sem escala fixa: **aplicar
+  a migration 021 do BANCO antes de implantar esta versão**. Sem ela o consumo
+  não inicia e o erro indica a migration.
+
 ### Timestamps e corte legado
 
 A fonte de `unix_time` é o payload, não o campo extraído do Stream. Exige token
 inteiro JSON não negativo; textos, booleanos, null, `1.0` e `1e0` não são inteiros
 JSON aceitos. O intervalo UTC suportado pelo serviço é de 0 a 253402300799 segundos
-(1970 até o fim de 9999), dentro de BIGINT. Não existe janela de atraso/futuro.
+(1970 até o fim de 9999), dentro de BIGINT. Não há limite de atraso; horário mais
+de 5 minutos à frente de `received_at` (diferença entre relógios) gera
+`timestamp_in_future` e o evento vai para a quarentena (SCRUM-632), para que uma
+leitura do futuro não vire o valor atual da estação.
 `received_at` é obrigatório, inteiro textual não negativo em ms, até
 253402300799999. Ausência/invalidez gera `invalid_received_at` ou
 `received_at_not_representable`; timestamp informado incorretamente gera
@@ -229,11 +261,27 @@ a persistência definitiva em produção (SCRUM-451/531).
 ## Destinos das medições — SCRUM-449
 
 `build_processing_plan(EventValidation)` é uma função sem escrita. Conserva a
-validação/origem e classifica cada campo como `reading`, `inconsistent` ou
-`quarantine`. A posição do campo identifica o resultado; a posição zero representa
+validação/origem e classifica cada campo como `reading`, `inconsistent`,
+`quarantine` ou `ignored`. A posição do campo identifica o resultado; a posição zero representa
 uma rejeição do evento inteiro, inclusive payload sem campos associáveis.
 Uma rejeição individual não impede o destino dos outros campos. O plano não é
 `ProcessingResult.COMPLETED` e nunca autoriza ACK.
+
+`ignored` (SCRUM-624): o datalogger envia todos os canais da placa, inclusive os
+sem sensor ligado. Campo de estação conhecida cujo identificador não tem sensor
+cadastrado nela (`unknown_sensor`) não é erro: fica em `telemetry_results` com
+destino `ignored`, sem leitura e sem quarentena. O payload original continua em
+`telemetry_events`; cadastrado o sensor, as próximas mensagens já são gravadas.
+Estação desconhecida, sensor ambíguo e valor inválido continuam na quarentena.
+Exige a migration 023 do BANCO (verificada na inicialização).
+
+Sensor desativado (`inactive_sensor`, SCRUM-632) segue o mesmo caminho do
+`ignored`: sem leitura e sem quarentena, com o payload preservado no evento.
+
+Limites (SCRUM-632): valem o mínimo e o máximo do sensor; se o sensor não tem
+nenhum dos dois, valem os do tipo (`sensor_types.min_value`/`max_value`, migration
+024 do BANCO). Fora da faixa, a leitura é gravada como inconsistente. A
+inicialização exige a migration 024.
 
 A SCRUM-451 integra esses destinos em uma transação PostgreSQL: leituras fora dos
 limites mantêm o valor exato e `data_consistent=false`, com ocorrência
@@ -321,7 +369,7 @@ measurement values or complete payloads.
 The persistence tests read the versioned schema and migrations from the sibling
 BANCO checkout (override with BANCO_SCHEMA_DIR). This is a **test-only dependency**;
 the installed package/image never imports or reads another repository at runtime.
-CI checks out a pinned BANCO revision with migration 018 and fails if any required
+CI checks out a pinned BANCO revision with migration 021 and fails if any required
 integration is skipped. Use RUN_INTEGRATION=1, TEST_DATABASE_URL and TEST_REDIS_URL
 against disposable services only.
 
