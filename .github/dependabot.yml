@@ -1,0 +1,24 @@
+# Atualizações mensais e agrupadas (um PR por ecossistema), sempre para a dev.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    target-branch: dev
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci
+  - package-ecosystem: pip
+    directory: /
+    target-branch: dev
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    groups:
+      minor-e-patch:
+        update-types: [minor, patch]
+    commit-message:
+      prefix: chore
